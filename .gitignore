@@ -1,0 +1,23 @@
+# ── Secrets ───────────────────────────────────────────────────
+.env
+
+# ── Character folders (contain bot tokens + personal configs) ─
+characters/
+
+# ── Python ────────────────────────────────────────────────────
+venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+dist/
+build/
+
+# ── macOS ─────────────────────────────────────────────────────
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# ── Logs ──────────────────────────────────────────────────────
+*.log
