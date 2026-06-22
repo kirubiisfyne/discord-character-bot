@@ -75,6 +75,9 @@ channel_bot_chains: dict[int, int] = {}
 # Webhook IDs owned by this bot instance — prevents the bot from replying to itself
 own_webhook_ids: set[int] = set()
 
+# Per-channel active response task — enables message interruption  {channel_id: asyncio.Task}
+channel_tasks: dict[int, asyncio.Task] = {}
+
 # ── Helper Functions ───────────────────────────────────────────────────────────
 
 def load_character() -> dict:
@@ -356,8 +359,15 @@ async def maybe_send_followup(
         followup_cfg.get("min_delay", 1.5),
         followup_cfg.get("max_delay", 4.0),
     )
+    # Snapshot history length before sleeping — if new messages arrive during the
+    # delay the conversation has moved on and the follow-up no longer makes sense.
+    snapshot_len = len(channel_histories[channel_id])
     log.debug(f"[💭] Follow-up triggered — waiting {delay:.2f}s")
     await asyncio.sleep(delay)
+
+    if len(channel_histories.get(channel_id, [])) != snapshot_len:
+        log.debug("[💭] Follow-up aborted — conversation moved on.")
+        return
 
     # ── Build a continuation-directive prompt ─────────────────────────────────
     system_prompt = character["system_prompt"].rstrip()
@@ -374,7 +384,9 @@ async def maybe_send_followup(
     messages = [{"role": "system", "content": system_prompt}] + channel_histories[channel_id]
 
     # ── Fetch the follow-up from the LLM ─────────────────────────────────────
-    followup_reply = await query_openrouter(messages, character)
+    # Cap token budget to 2 sentences — we hard-trim anyway, no need to pay for more.
+    followup_character = {**character, "max_sentences": 2}
+    followup_reply = await query_openrouter(messages, followup_character)
     if not followup_reply:
         return
 
@@ -391,6 +403,75 @@ async def maybe_send_followup(
     channel_histories[channel_id].append({"role": "assistant", "content": followup_reply})
     log.info(f"[#{channel.name}] ↩ Follow-up: {followup_reply[:80]}")
     await send_as_character(channel, followup_reply, character, fallback)
+
+
+async def _process_human_message(
+    message:   discord.Message,
+    character: dict,
+    msgs:      list[dict],
+) -> None:
+    """
+    Full response pipeline for a single human message.
+
+    Runs as a cancellable asyncio.Task — when the same user sends another message
+    while this is in-flight, the active task is cancelled and a fresh one starts,
+    ensuring the bot only ever replies to the latest context in the channel.
+
+    Cancellation is safe at every await point:
+      ① asyncio.sleep (read_delay)    — free, zero API cost
+      ② query_openrouter / aiohttp    — aborts the HTTP request mid-flight
+      ③ asyncio.sleep (typing pad)    — LLM already responded (one call cost sunk)
+    """
+    channel_id = message.channel.id
+
+    # ── Phase 1: Silent reading delay (cancellation point ①) ──────────────────
+    read_delay = timing_engine.calculate_reading_delay(message.content)
+    log.debug(f"[⏱] Reading delay: {read_delay:.2f}s")
+    await asyncio.sleep(read_delay)
+
+    # ── Phase 2+3: LLM under typing indicator; pad remaining to typing_duration ──
+    # The indicator opens before the LLM call and stays open until the
+    # response-proportional duration is fully consumed, so users always see
+    # feedback during the slow generation step.
+    llm_start = asyncio.get_event_loop().time()
+    async with message.channel.typing():
+        reply = await query_openrouter(msgs, character)   # cancellation point ②
+
+        if not reply:
+            log.warning("No reply received from OpenRouter.")
+            return
+
+        reply = strip_action_text(reply)
+        reply = trim_to_sentences(reply, character.get("max_sentences", 3))
+
+        typing_duration = timing_engine.calculate_typing_duration(reply)
+        elapsed  = asyncio.get_event_loop().time() - llm_start
+        leftover = typing_duration - elapsed
+        log.debug(
+            f"[⌨️] Typing: {typing_duration:.2f}s target "
+            f"(LLM {elapsed:.2f}s, padding {max(0.0, leftover):.2f}s)"
+        )
+        if leftover > 0:
+            await asyncio.sleep(leftover)   # cancellation point ③
+
+    # ── Phase 4: Deliver ────────────────────────────────────────────────────
+    channel_histories[channel_id].append({"role": "assistant", "content": reply})
+    log.info(f"[#{message.channel.name}] {character['name']}: {reply[:80]}")
+
+    await send_as_character(
+        channel=message.channel,
+        text=reply,
+        character=character,
+        fallback=message,
+    )
+
+    # ── Phase 5: Optional follow-up ─────────────────────────────────────────
+    await maybe_send_followup(
+        channel=message.channel,
+        channel_id=channel_id,
+        character=character,
+        fallback=message,
+    )
 
 
 # ── Bot Initialisation ─────────────────────────────────────────────────────────
@@ -473,45 +554,18 @@ async def on_message(message: discord.Message):
 
     msgs = build_messages(channel_id, message.author.display_name, message.content, character)
     log.info(f"[#{message.channel.name}] {message.author.display_name}: {message.content[:80]}")
+    # Note: build_messages appends the user message to channel_histories here,
+    # before any task is created, so context is preserved even on cancellation.
 
-    # ── Phase 1: Silent reading delay (bot appears completely idle) ────────────
-    read_delay = timing_engine.calculate_reading_delay(message.content)
-    log.debug(f"[⏱] Reading delay: {read_delay:.2f}s")
-    await asyncio.sleep(read_delay)
+    # ── Cancel any in-flight response for this channel ─────────────────────────
+    prior = channel_tasks.get(channel_id)
+    if prior and not prior.done():
+        prior.cancel()
+        log.info(f"[⚡] Interrupted prior response in #{message.channel.name}")
 
-    # ── Phase 2: Fetch LLM response ───────────────────────────────────────────
-    reply = await query_openrouter(msgs, character)
-
-    if not reply:
-        log.warning("No reply received from OpenRouter.")
-        return
-
-    reply = strip_action_text(reply)
-    reply = trim_to_sentences(reply, character.get("max_sentences", 3))
-
-    # ── Phase 3: Typing indicator held for a response-proportional duration ───
-    typing_duration = timing_engine.calculate_typing_duration(reply)
-    log.debug(f"[⌨️] Typing duration: {typing_duration:.2f}s")
-    async with message.channel.typing():
-        await asyncio.sleep(typing_duration)
-
-    # ── Phase 4: Deliver the message after the typing block exits ─────────────
-    channel_histories[channel_id].append({"role": "assistant", "content": reply})
-    log.info(f"[#{message.channel.name}] {character['name']}: {reply[:80]}")
-
-    await send_as_character(
-        channel=message.channel,
-        text=reply,
-        character=character,
-        fallback=message,
-    )
-
-    # ── Phase 5: Optional follow-up / continuation message ───────────────────
-    await maybe_send_followup(
-        channel=message.channel,
-        channel_id=channel_id,
-        character=character,
-        fallback=message,
+    # ── Launch new cancellable response task ───────────────────────────────────
+    channel_tasks[channel_id] = asyncio.create_task(
+        _process_human_message(message, character, msgs)
     )
 
 
@@ -522,7 +576,12 @@ async def on_message(message: discord.Message):
 async def forget(ctx: commands.Context):
     """Wipe conversation history for this channel. Requires Manage Messages."""
     channel_histories.pop(ctx.channel.id, None)
-    channel_webhooks.pop(ctx.channel.id, None)
+    wh = channel_webhooks.pop(ctx.channel.id, None)
+    if wh:
+        own_webhook_ids.discard(wh.id)   # prune stale webhook ID from guard set
+    task = channel_tasks.pop(ctx.channel.id, None)
+    if task and not task.done():
+        task.cancel()                     # abort any in-flight response cleanly
     await ctx.message.delete(delay=0)
     await ctx.send("🧹 Memory wiped. Fresh start.", delete_after=5)
 
