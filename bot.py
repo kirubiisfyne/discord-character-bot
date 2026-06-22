@@ -65,6 +65,8 @@ load_dotenv(ENV_FILE)
 DISCORD_BOT_TOKEN  = os.getenv("DISCORD_BOT_TOKEN")
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 OPENROUTER_URL     = "https://openrouter.ai/api/v1/chat/completions"
+SERPAPI_KEY        = os.getenv("SERPAPI_KEY")       # Feature 2 — Pinterest pipeline
+PINTEREST_BOARD    = os.getenv("PINTEREST_BOARD")   # Feature 2 — Pinterest pipeline
 
 # ── In-memory State ────────────────────────────────────────────────────────────
 
@@ -194,6 +196,174 @@ async def select_local_image(tag: str = None) -> str | None:
 
     row = await cursor.fetchone()
     return row["filename"] if row else None
+
+
+# ── Feature 2: Pinterest Pipeline functions ──────────────────────────────────
+
+async def fetch_pins_serpapi(board_name: str, count: int = 10) -> list[dict]:
+    """
+    Fetch pins from a Pinterest board via SerpApi.
+    Returns a list of {pin_id, image_url} dicts.
+    Requires SERPAPI_KEY in environment.
+    """
+    if not SERPAPI_KEY:
+        log.error("fetch_pins_serpapi: SERPAPI_KEY is not set.")
+        return []
+
+    params = {
+        "engine":           "pinterest",
+        "pinterest_board":  board_name,
+        "api_key":          SERPAPI_KEY,
+        "num":              count,
+    }
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                "https://serpapi.com/search.json",
+                params=params,
+                timeout=aiohttp.ClientTimeout(total=30),
+            ) as resp:
+                if resp.status != 200:
+                    body = await resp.text()
+                    log.error(f"SerpApi error {resp.status}: {body[:200]}")
+                    return []
+
+                data = await resp.json()
+                pins = []
+                for result in data.get("pins", []):
+                    pin_id = result.get("id")
+                    img    = result.get("images", {}).get("orig", {}).get("url")
+                    if pin_id and img:
+                        pins.append({"pin_id": str(pin_id), "image_url": img})
+                log.info(f"📌 SerpApi returned {len(pins)} pins for board '{board_name}'.")
+                return pins
+
+    except Exception as e:
+        log.error(f"fetch_pins_serpapi exception: {e}")
+        return []
+
+
+async def sync_pins_to_db(board_identifier: str):
+    """
+    Fetch fresh pins from SerpApi and insert any new ones into procedural_pins.
+    Uses INSERT OR IGNORE so existing pins are never overwritten.
+    Called from on_ready() — runs once per startup.
+    """
+    pins = await fetch_pins_serpapi(board_identifier)
+    if not pins:
+        log.warning("sync_pins_to_db: no pins returned — check SERPAPI_KEY and PINTEREST_BOARD.")
+        return
+
+    db = await get_db()
+    for pin in pins:
+        await db.execute(
+            "INSERT OR IGNORE INTO procedural_pins (pin_id, image_url) VALUES (?, ?)",
+            (pin["pin_id"], pin["image_url"])
+        )
+    await db.commit()
+    log.info(f"📌 Pin sync complete — {len(pins)} pins processed.")
+
+
+async def select_procedural_pin():
+    """
+    Return the least-used pin not sent in the last 24 hours.
+    Returns an aiosqlite.Row with pin_id and image_url, or None if pool is dry.
+    """
+    db = await get_db()
+    cutoff = int(time.time()) - 86400
+    cursor = await db.execute(
+        """SELECT pin_id, image_url FROM procedural_pins
+           WHERE last_sent_at < ?
+           ORDER BY use_count ASC LIMIT 1""",
+        (cutoff,)
+    )
+    return await cursor.fetchone()
+
+
+async def download_image_bytes(url: str) -> bytes | None:
+    """Download an image from a URL and return its raw bytes. Returns None on failure."""
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=20)) as resp:
+                if resp.status == 200:
+                    return await resp.read()
+                log.error(f"Image download failed: HTTP {resp.status} for {url}")
+                return None
+    except Exception as e:
+        log.error(f"download_image_bytes exception: {e}")
+        return None
+
+
+async def generate_caption_via_openrouter(
+    image_bytes: bytes,
+    channel_id:  int,
+    character:   dict,
+) -> str | None:
+    """
+    Generate a mood-aware, in-character caption for an image.
+    Uses an OpenRouter vision model — no separate Gemini API key needed.
+    Integrates Feature 3's mood context automatically.
+    """
+    # Build mood-enriched system prompt (Feature 3 integration)
+    mood_prompt = await build_mood_aware_prompt(channel_id, character["system_prompt"])
+    caption_instruction = (
+        "\n\nYou are looking at an image. Write a short first-person reaction "
+        "(2–3 sentences) as your character. Be natural, match the chat energy, "
+        "no asterisk action text."
+    )
+
+    image_b64    = base64.b64encode(image_bytes).decode("utf-8")
+    vision_model = character.get("vision_model", "google/gemini-2.0-flash-exp:free")
+
+    headers = {
+        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+        "Content-Type":  "application/json",
+        "HTTP-Referer":  "https://github.com/your-username/discord-character-bot",
+        "X-Title":       f"{character['name']} Discord Bot",
+    }
+    payload = {
+        "model":       vision_model,
+        "max_tokens":  200,
+        "temperature": character.get("temperature", 0.85),
+        "messages": [
+            {
+                "role":    "system",
+                "content": mood_prompt + caption_instruction,
+            },
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type":      "image_url",
+                        "image_url": {"url": f"data:image/jpeg;base64,{image_b64}"},
+                    },
+                    {
+                        "type": "text",
+                        "text": "React to this image in character.",
+                    },
+                ],
+            },
+        ],
+    }
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                OPENROUTER_URL,
+                headers=headers,
+                json=payload,
+                timeout=aiohttp.ClientTimeout(total=60),
+            ) as resp:
+                if resp.status != 200:
+                    body = await resp.text()
+                    log.error(f"Vision model {resp.status}: {body[:200]}")
+                    return None
+                data = await resp.json()
+                return data["choices"][0]["message"]["content"].strip()
+    except Exception as e:
+        log.error(f"generate_caption_via_openrouter exception: {e}")
+        return None
 
 
 async def get_channel_context(channel_id: int, limit: int = 10) -> str:
@@ -658,9 +828,9 @@ bot = commands.Bot(command_prefix="!char ", intents=intents)
 async def on_ready():
     await init_db()                           # Phase 0 — SQLite foundation
     await seed_gallery()                       # Phase 1 — Anti-Repetition Media Engine
-    # board = os.getenv("PINTEREST_BOARD")    # Phase 2 — uncomment when Feature 2 is added
-    # if board:                               # Phase 2
-    #     await sync_pins_to_db(board)        # Phase 2
+    board = os.getenv("PINTEREST_BOARD")
+    if board:
+        await sync_pins_to_db(board)          # Phase 2 — Pinterest Pipeline
     log.info(f"✅  Logged in as {bot.user} (ID: {bot.user.id})")
     log.info("─" * 40)
 
@@ -866,6 +1036,61 @@ async def post_life(ctx: commands.Context, tag: str = None):
     except Exception as e:
         await ctx.send("Couldn't send the image right now. 🌱")
         log.error(f"postlife error: {e}")
+
+
+@bot.command(name="postidea")
+async def post_idea(ctx: commands.Context):
+    """Post a non-repeating Pinterest pin with a mood-aware AI caption. Usage: !char postidea"""
+    character = load_character()
+
+    pin = await select_procedural_pin()
+    if not pin:
+        await ctx.send("No fresh pins available right now. 📌 Try again tomorrow.")
+        return
+
+    async with ctx.channel.typing():
+        image_bytes = await download_image_bytes(pin["image_url"])
+        if not image_bytes:
+            await ctx.send("Couldn't fetch that image. Try again in a moment.")
+            return
+
+        caption = await generate_caption_via_openrouter(image_bytes, ctx.channel.id, character)
+
+        # Fallback caption if vision model fails
+        if not caption:
+            caption = "✨"
+            log.warning("postidea: caption generation failed — using fallback.")
+
+        caption = strip_action_text(caption)
+        caption = trim_to_sentences(caption, character.get("max_sentences", 3))
+
+    try:
+        file    = discord.File(BytesIO(image_bytes), filename="pin.jpg")
+        webhook = await get_or_create_webhook(ctx.channel, character["name"])
+
+        if webhook:
+            await webhook.send(
+                content=caption,
+                file=file,
+                username=character["name"],
+                avatar_url=character.get("avatar_url"),
+            )
+        else:
+            await ctx.send(content=caption, file=file)
+
+        db = await get_db()
+        await db.execute(
+            """UPDATE procedural_pins
+               SET last_sent_at = ?, use_count = use_count + 1
+               WHERE pin_id = ?""",
+            (int(time.time()), pin["pin_id"])
+        )
+        await db.commit()
+        log.info(f"📌 Posted pin {pin['pin_id']} with generated caption.")
+
+    except Exception as e:
+        await ctx.send("Something went wrong posting the idea. 🌿")
+        log.error(f"postidea send error: {e}")
 
 
 @forget.error
