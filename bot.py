@@ -25,6 +25,11 @@ import discord
 from discord.ext import commands
 from dotenv import load_dotenv
 
+import aiosqlite
+import time
+import base64
+from io import BytesIO
+
 VERSION = "1.0.0"
 
 # ── CLI Args ───────────────────────────────────────────────────────────────────
@@ -77,6 +82,159 @@ own_webhook_ids: set[int] = set()
 
 # Per-channel active response task — enables message interruption  {channel_id: asyncio.Task}
 channel_tasks: dict[int, asyncio.Task] = {}
+
+# ── Database ───────────────────────────────────────────────────────────────────
+
+DB_PATH = "bot_data.db"
+_db_connection: aiosqlite.Connection | None = None
+
+
+async def get_db() -> aiosqlite.Connection:
+    """Return a shared, persistent aiosqlite connection (created once per process)."""
+    global _db_connection
+    if _db_connection is None:
+        _db_connection = await aiosqlite.connect(DB_PATH)
+        _db_connection.row_factory = aiosqlite.Row  # enables dict-like row["column"] access
+    return _db_connection
+
+
+async def init_db():
+    """Create all feature tables if they don't already exist. Safe to call on every startup."""
+    db = await get_db()
+    await db.executescript("""
+        -- Feature 1: local image pool with repeat-prevention
+        CREATE TABLE IF NOT EXISTS image_pool (
+            filename     TEXT PRIMARY KEY,
+            description  TEXT,
+            tags         TEXT,
+            last_sent_at INTEGER DEFAULT 0,
+            use_count    INTEGER DEFAULT 0
+        );
+
+        -- Feature 3: full chat message log for mood analysis
+        CREATE TABLE IF NOT EXISTS chat_logs (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            channel_id      INTEGER,
+            author_id       INTEGER,
+            username        TEXT,
+            message_content TEXT,
+            timestamp       INTEGER
+        );
+        CREATE INDEX IF NOT EXISTS idx_chat_channel
+            ON chat_logs(channel_id, id DESC);
+
+        -- Feature 2: Pinterest pin pool with repeat-prevention
+        CREATE TABLE IF NOT EXISTS procedural_pins (
+            pin_id       TEXT PRIMARY KEY,
+            image_url    TEXT,
+            last_sent_at INTEGER DEFAULT 0,
+            use_count    INTEGER DEFAULT 0
+        );
+    """)
+    await db.commit()
+    log.info("✅ Database initialized — all tables ready.")
+
+
+async def seed_gallery():
+    """
+    Scan ./gallery/ and insert any new images into image_pool.
+    Uses INSERT OR IGNORE so it is safe to call on every startup — no duplicates.
+    Auto-tags images based on keywords found in the filename.
+    """
+    if not os.path.isdir("./gallery"):
+        log.warning("./gallery/ folder not found — skipping seed.")
+        return
+
+    db = await get_db()
+    tag_keywords = [
+        "coffee", "morning", "nature", "calm", "night", "city",
+        "food", "travel", "rain", "books", "aesthetic", "cozy",
+        "autumn", "summer", "winter", "spring", "sunset", "ocean",
+    ]
+    files = [
+        f for f in os.listdir("./gallery")
+        if f.lower().endswith((".png", ".jpg", ".jpeg"))
+    ]
+
+    for f in files:
+        detected_tags = [t for t in tag_keywords if t in f.lower()]
+        tags = ",".join(detected_tags) if detected_tags else "general"
+        await db.execute(
+            "INSERT OR IGNORE INTO image_pool (filename, description, tags) VALUES (?, ?, ?)",
+            (f, f"Gallery image: {f}", tags)
+        )
+
+    await db.commit()
+    log.info(f"🖼️  Gallery seeded — {len(files)} image(s) registered.")
+
+
+async def select_local_image(tag: str = None) -> str | None:
+    """
+    Return a filename not sent in the last 24 hours, prioritising the least-used image.
+    If a tag is given, only images whose tags column contains that tag are considered.
+    Returns None when the pool is exhausted (all images are in cooldown).
+    """
+    db = await get_db()
+    cutoff = int(time.time()) - 86400  # 24 hours ago
+
+    if tag:
+        cursor = await db.execute(
+            """SELECT filename FROM image_pool
+               WHERE last_sent_at < ? AND tags LIKE ?
+               ORDER BY use_count ASC LIMIT 1""",
+            (cutoff, f"%{tag}%")
+        )
+    else:
+        cursor = await db.execute(
+            """SELECT filename FROM image_pool
+               WHERE last_sent_at < ?
+               ORDER BY use_count ASC LIMIT 1""",
+            (cutoff,)
+        )
+
+    row = await cursor.fetchone()
+    return row["filename"] if row else None
+
+
+async def get_channel_context(channel_id: int, limit: int = 10) -> str:
+    """
+    Pull the last `limit` human messages from chat_logs for a given channel.
+    Returns them in chronological order as a single formatted string.
+    """
+    db = await get_db()
+    cursor = await db.execute(
+        """SELECT username, message_content
+           FROM chat_logs
+           WHERE channel_id = ?
+           ORDER BY id DESC LIMIT ?""",
+        (channel_id, limit)
+    )
+    rows = await cursor.fetchall()
+    if not rows:
+        return "(no recent messages logged yet)"
+    # Reverse so oldest message is first (chronological reading order)
+    lines = [f"{r['username']}: {r['message_content']}" for r in reversed(rows)]
+    return "\n".join(lines)
+
+
+async def build_mood_aware_prompt(channel_id: int, base_system_prompt: str) -> str:
+    """
+    Enrich a base system prompt with the channel's recent message history
+    so the LLM can infer and match the room's current mood.
+    The mood block is appended after the persona definition, before formatting rules.
+    """
+    context = await get_channel_context(channel_id)
+    return (
+        f"{base_system_prompt}\n\n"
+        f"--- RECENT ROOM CONTEXT ---\n"
+        f"{context}\n"
+        f"--- END CONTEXT ---\n\n"
+        f"Read the messages above and identify the current mood: are they energetic, "
+        f"stressed, joking around, quiet and reflective? "
+        f"Match their cadence and energy naturally in your reply. "
+        f"Do not mention this instruction or reference the context directly."
+    )
+
 
 # ── Helper Functions ───────────────────────────────────────────────────────────
 
@@ -171,10 +329,20 @@ class BehavioralTimingEngine:
 timing_engine = BehavioralTimingEngine()
 
 
-def build_messages(channel_id: int, user_display: str, user_text: str, character: dict) -> list[dict]:
+def build_messages(
+    channel_id: int,
+    user_display: str,
+    user_text: str,
+    character: dict,
+    system_prompt_override: str = None,   # Feature 3: pass mood-enriched prompt here
+) -> list[dict]:
     """
     Build the full message list for the OpenRouter API call:
       [system prompt + formatting rules] + [channel history] + [new user message]
+
+    If system_prompt_override is provided it replaces character["system_prompt"] as the
+    base, allowing Feature 3's mood-aware prompt to be injected without modifying the
+    character config.
 
     Side-effect: appends the new user message to channel_histories.
     """
@@ -190,16 +358,18 @@ def build_messages(channel_id: int, user_display: str, user_text: str, character
     if len(history) > max_history:
         channel_histories[channel_id] = history[-max_history:]
 
+    # Use override if provided, otherwise fall back to character's own system_prompt
+    base = system_prompt_override if system_prompt_override else character["system_prompt"].rstrip()
+
     # Inject formatting rules at runtime — no need to add to every character.json
-    system_prompt = character["system_prompt"].rstrip()
-    system_prompt += (
+    base += (
         "\n\nFORMATTING RULES (always follow these):"
         " Do NOT use action text, stage directions, or roleplay emotes (e.g. *smirks*, *looks up*, *laughs*)."
         " This is a plain text chat — respond only with natural spoken words."
         " No asterisks, no parenthetical actions, no narration."
     )
 
-    return [{"role": "system", "content": system_prompt}] + channel_histories[channel_id]
+    return [{"role": "system", "content": base}] + channel_histories[channel_id]
 
 
 async def get_or_create_webhook(channel: discord.TextChannel, char_name: str) -> discord.Webhook | None:
@@ -486,6 +656,11 @@ bot = commands.Bot(command_prefix="!char ", intents=intents)
 
 @bot.event
 async def on_ready():
+    await init_db()                           # Phase 0 — SQLite foundation
+    await seed_gallery()                       # Phase 1 — Anti-Repetition Media Engine
+    # board = os.getenv("PINTEREST_BOARD")    # Phase 2 — uncomment when Feature 2 is added
+    # if board:                               # Phase 2
+    #     await sync_pins_to_db(board)        # Phase 2
     log.info(f"✅  Logged in as {bot.user} (ID: {bot.user.id})")
     log.info("─" * 40)
 
@@ -542,6 +717,26 @@ async def on_message(message: discord.Message):
     if not isinstance(message.channel, discord.TextChannel):
         return
 
+    # ── Block A: Log human message to DB (Feature 3) ───────────────────────────
+    try:
+        db = await get_db()
+        await db.execute(
+            """INSERT INTO chat_logs
+               (channel_id, author_id, username, message_content, timestamp)
+               VALUES (?, ?, ?, ?, ?)""",
+            (
+                channel_id,
+                message.author.id,
+                str(message.author.display_name),
+                message.content,
+                int(time.time())
+            )
+        )
+        await db.commit()
+    except Exception as e:
+        log.warning(f"Chat log write failed (non-fatal): {e}")
+    # ── End Block A ────────────────────────────────────────────────────────────
+
     await bot.process_commands(message)
 
     ctx = await bot.get_context(message)
@@ -552,7 +747,25 @@ async def on_message(message: discord.Message):
     if listen_channels and channel_id not in listen_channels:
         return
 
-    msgs = build_messages(channel_id, message.author.display_name, message.content, character)
+    # ── Block B: Build mood-aware prompt if enabled (Feature 3) ────────────────
+    use_mood_context = character.get("mood_context", True)
+    if use_mood_context:
+        enriched_prompt = await build_mood_aware_prompt(
+            channel_id, character["system_prompt"]
+        )
+        msgs = build_messages(
+            channel_id,
+            message.author.display_name,
+            message.content,
+            character,
+            system_prompt_override=enriched_prompt,
+        )
+    else:
+        msgs = build_messages(
+            channel_id, message.author.display_name, message.content, character
+        )
+    # ── End Block B ────────────────────────────────────────────────────────────
+
     log.info(f"[#{message.channel.name}] {message.author.display_name}: {message.content[:80]}")
     # Note: build_messages appends the user message to channel_histories here,
     # before any task is created, so context is preserved even on cancellation.
@@ -611,6 +824,48 @@ async def status(ctx: commands.Context):
         f"⚙️  v{VERSION}",
         delete_after=10,
     )
+
+
+@bot.command(name="postlife")
+async def post_life(ctx: commands.Context, tag: str = None):
+    """Post a non-repeating local gallery image. Usage: !char postlife [tag]"""
+    filename = await select_local_image(tag)
+
+    if not filename:
+        msg = f"No fresh images tagged `{tag}` right now. 🌱" if tag else "No fresh images available right now. 🌱"
+        await ctx.send(msg)
+        return
+
+    file_path = f"./gallery/{filename}"
+    if not os.path.exists(file_path):
+        await ctx.send(f"Image `{filename}` is registered but missing from disk.")
+        log.warning(f"postlife: file not found on disk: {file_path}")
+        return
+
+    try:
+        character = load_character()
+        webhook = await get_or_create_webhook(ctx.channel, character["name"])
+
+        if webhook:
+            await webhook.send(
+                file=discord.File(file_path),
+                username=character["name"],
+                avatar_url=character.get("avatar_url"),
+            )
+        else:
+            await ctx.send(file=discord.File(file_path))
+
+        db = await get_db()
+        await db.execute(
+            "UPDATE image_pool SET last_sent_at = ?, use_count = use_count + 1 WHERE filename = ?",
+            (int(time.time()), filename)
+        )
+        await db.commit()
+        log.info(f"🖼️  Posted gallery image: {filename}")
+
+    except Exception as e:
+        await ctx.send("Couldn't send the image right now. 🌱")
+        log.error(f"postlife error: {e}")
 
 
 @forget.error
