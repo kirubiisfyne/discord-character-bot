@@ -1,5 +1,5 @@
 """
-Discord Character Bot  v1.0.0
+Discord Character Bot  v1.1.0
 ──────────────────────────────
 Run fully configurable AI personas in Discord using OpenRouter LLMs.
 Each character posts via webhook — custom name and avatar, no BOT badge.
@@ -19,6 +19,8 @@ import logging
 import asyncio
 import argparse
 import random
+import subprocess
+import urllib.request
 
 import aiohttp
 import discord
@@ -43,6 +45,11 @@ parser.add_argument(
     metavar="PATH",
     help="Path to character folder containing character.json and .env (default: current dir)",
 )
+parser.add_argument(
+    "--local",
+    action="store_true",
+    help="Run LLM requests locally via Ollama (spawns 'ollama serve' if not running)",
+)
 args = parser.parse_args()
 
 CHARACTER_DIR  = os.path.abspath(args.character)
@@ -63,12 +70,29 @@ log = logging.getLogger("CharacterBot")
 load_dotenv(ENV_FILE)
 
 DISCORD_BOT_TOKEN  = os.getenv("DISCORD_BOT_TOKEN")
-OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
-OPENROUTER_URL     = "https://openrouter.ai/api/v1/chat/completions"
-SERPAPI_KEY        = os.getenv("SERPAPI_KEY")       # Feature 2 — Pinterest pipeline
-PINTEREST_BOARD    = os.getenv("PINTEREST_BOARD")   # Feature 2 — Pinterest pipeline
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "dummy-local-key")
+LLM_API_URL        = os.getenv("LLM_API_URL", "https://openrouter.ai/api/v1/chat/completions")
 
 # ── In-memory State ────────────────────────────────────────────────────────────
+
+def get_llm_endpoint(character: dict) -> str:
+    """Returns the local Ollama URL if run_local is True, otherwise the configured URL."""
+    if character.get("run_local", False):
+        return "http://localhost:11434/v1/chat/completions"
+    return LLM_API_URL
+
+def ensure_ollama_running():
+    """Checks if Ollama is running, and starts it in the background if not."""
+    try:
+        urllib.request.urlopen("http://localhost:11434/", timeout=1)
+    except Exception:
+        log.info("Ollama is not running. Starting 'ollama serve' in the background...")
+        try:
+            subprocess.Popen(["ollama", "serve"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            import time
+            time.sleep(2)  # Give it a moment to bind to the port
+        except FileNotFoundError:
+            log.error("Failed to start Ollama. Is it installed and in your PATH?")
 
 # Per-channel conversation history  {channel_id: [{"role": ..., "content": ...}]}
 channel_histories: dict[int, list[dict]] = {}
@@ -78,6 +102,12 @@ channel_webhooks: dict[int, discord.Webhook] = {}
 
 # Per-channel consecutive bot-to-bot message counter  {channel_id: int}
 channel_bot_chains: dict[int, int] = {}
+
+# Per-channel last internal thought  {channel_id: str}
+channel_last_thoughts: dict[int, str] = {}
+
+# Message counter for memory extraction {channel_id: int}
+channel_msg_counts: dict[int, int] = {}
 
 # Webhook IDs owned by this bot instance — prevents the bot from replying to itself
 own_webhook_ids: set[int] = set()
@@ -125,13 +155,16 @@ async def init_db():
         CREATE INDEX IF NOT EXISTS idx_chat_channel
             ON chat_logs(channel_id, id DESC);
 
-        -- Feature 2: Pinterest pin pool with repeat-prevention
-        CREATE TABLE IF NOT EXISTS procedural_pins (
-            pin_id       TEXT PRIMARY KEY,
-            image_url    TEXT,
-            last_sent_at INTEGER DEFAULT 0,
-            use_count    INTEGER DEFAULT 0
+        -- Feature 4: Episodic memory extraction
+        CREATE TABLE IF NOT EXISTS core_memories (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            channel_id  INTEGER,
+            character   TEXT,
+            memory      TEXT,
+            timestamp   INTEGER
         );
+        CREATE INDEX IF NOT EXISTS idx_memories_channel
+            ON core_memories(channel_id, id DESC);
     """)
     await db.commit()
     log.info("✅ Database initialized — all tables ready.")
@@ -170,200 +203,30 @@ async def seed_gallery():
     log.info(f"🖼️  Gallery seeded — {len(files)} image(s) registered.")
 
 
-async def select_local_image(tag: str = None) -> str | None:
+async def select_local_image(tag: str = None) -> dict | None:
     """
-    Return a filename not sent in the last 24 hours, prioritising the least-used image.
-    If a tag is given, only images whose tags column contains that tag are considered.
-    Returns None when the pool is exhausted (all images are in cooldown).
+    Return a dict containing filename, description, and tags for an image.
     """
     db = await get_db()
     cutoff = int(time.time()) - 86400  # 24 hours ago
 
     if tag:
         cursor = await db.execute(
-            """SELECT filename FROM image_pool
+            """SELECT filename, description, tags FROM image_pool
                WHERE last_sent_at < ? AND tags LIKE ?
                ORDER BY use_count ASC LIMIT 1""",
             (cutoff, f"%{tag}%")
         )
     else:
         cursor = await db.execute(
-            """SELECT filename FROM image_pool
+            """SELECT filename, description, tags FROM image_pool
                WHERE last_sent_at < ?
                ORDER BY use_count ASC LIMIT 1""",
             (cutoff,)
         )
 
     row = await cursor.fetchone()
-    return row["filename"] if row else None
-
-
-# ── Feature 2: Pinterest Pipeline functions ──────────────────────────────────
-
-async def fetch_pins_serpapi(board_name: str, count: int = 10) -> list[dict]:
-    """
-    Fetch pins from a Pinterest board via SerpApi.
-    Returns a list of {pin_id, image_url} dicts.
-    Requires SERPAPI_KEY in environment.
-    """
-    if not SERPAPI_KEY:
-        log.error("fetch_pins_serpapi: SERPAPI_KEY is not set.")
-        return []
-
-    params = {
-        "engine":           "pinterest",
-        "pinterest_board":  board_name,
-        "api_key":          SERPAPI_KEY,
-        "num":              count,
-    }
-
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(
-                "https://serpapi.com/search.json",
-                params=params,
-                timeout=aiohttp.ClientTimeout(total=30),
-            ) as resp:
-                if resp.status != 200:
-                    body = await resp.text()
-                    log.error(f"SerpApi error {resp.status}: {body[:200]}")
-                    return []
-
-                data = await resp.json()
-                pins = []
-                for result in data.get("pins", []):
-                    pin_id = result.get("id")
-                    img    = result.get("images", {}).get("orig", {}).get("url")
-                    if pin_id and img:
-                        pins.append({"pin_id": str(pin_id), "image_url": img})
-                log.info(f"📌 SerpApi returned {len(pins)} pins for board '{board_name}'.")
-                return pins
-
-    except Exception as e:
-        log.error(f"fetch_pins_serpapi exception: {e}")
-        return []
-
-
-async def sync_pins_to_db(board_identifier: str):
-    """
-    Fetch fresh pins from SerpApi and insert any new ones into procedural_pins.
-    Uses INSERT OR IGNORE so existing pins are never overwritten.
-    Called from on_ready() — runs once per startup.
-    """
-    pins = await fetch_pins_serpapi(board_identifier)
-    if not pins:
-        log.warning("sync_pins_to_db: no pins returned — check SERPAPI_KEY and PINTEREST_BOARD.")
-        return
-
-    db = await get_db()
-    for pin in pins:
-        await db.execute(
-            "INSERT OR IGNORE INTO procedural_pins (pin_id, image_url) VALUES (?, ?)",
-            (pin["pin_id"], pin["image_url"])
-        )
-    await db.commit()
-    log.info(f"📌 Pin sync complete — {len(pins)} pins processed.")
-
-
-async def select_procedural_pin():
-    """
-    Return the least-used pin not sent in the last 24 hours.
-    Returns an aiosqlite.Row with pin_id and image_url, or None if pool is dry.
-    """
-    db = await get_db()
-    cutoff = int(time.time()) - 86400
-    cursor = await db.execute(
-        """SELECT pin_id, image_url FROM procedural_pins
-           WHERE last_sent_at < ?
-           ORDER BY use_count ASC LIMIT 1""",
-        (cutoff,)
-    )
-    return await cursor.fetchone()
-
-
-async def download_image_bytes(url: str) -> bytes | None:
-    """Download an image from a URL and return its raw bytes. Returns None on failure."""
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url, timeout=aiohttp.ClientTimeout(total=20)) as resp:
-                if resp.status == 200:
-                    return await resp.read()
-                log.error(f"Image download failed: HTTP {resp.status} for {url}")
-                return None
-    except Exception as e:
-        log.error(f"download_image_bytes exception: {e}")
-        return None
-
-
-async def generate_caption_via_openrouter(
-    image_bytes: bytes,
-    channel_id:  int,
-    character:   dict,
-) -> str | None:
-    """
-    Generate a mood-aware, in-character caption for an image.
-    Uses an OpenRouter vision model — no separate Gemini API key needed.
-    Integrates Feature 3's mood context automatically.
-    """
-    # Build mood-enriched system prompt (Feature 3 integration)
-    mood_prompt = await build_mood_aware_prompt(channel_id, character["system_prompt"])
-    caption_instruction = (
-        "\n\nYou are looking at an image. Write a short first-person reaction "
-        "(2–3 sentences) as your character. Be natural, match the chat energy, "
-        "no asterisk action text."
-    )
-
-    image_b64    = base64.b64encode(image_bytes).decode("utf-8")
-    vision_model = character.get("vision_model", "google/gemini-2.0-flash-exp:free")
-
-    headers = {
-        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
-        "Content-Type":  "application/json",
-        "HTTP-Referer":  "https://github.com/your-username/discord-character-bot",
-        "X-Title":       f"{character['name']} Discord Bot",
-    }
-    payload = {
-        "model":       vision_model,
-        "max_tokens":  200,
-        "temperature": character.get("temperature", 0.85),
-        "messages": [
-            {
-                "role":    "system",
-                "content": mood_prompt + caption_instruction,
-            },
-            {
-                "role": "user",
-                "content": [
-                    {
-                        "type":      "image_url",
-                        "image_url": {"url": f"data:image/jpeg;base64,{image_b64}"},
-                    },
-                    {
-                        "type": "text",
-                        "text": "React to this image in character.",
-                    },
-                ],
-            },
-        ],
-    }
-
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.post(
-                OPENROUTER_URL,
-                headers=headers,
-                json=payload,
-                timeout=aiohttp.ClientTimeout(total=60),
-            ) as resp:
-                if resp.status != 200:
-                    body = await resp.text()
-                    log.error(f"Vision model {resp.status}: {body[:200]}")
-                    return None
-                data = await resp.json()
-                return data["choices"][0]["message"]["content"].strip()
-    except Exception as e:
-        log.error(f"generate_caption_via_openrouter exception: {e}")
-        return None
+    return dict(row) if row else None
 
 
 async def get_channel_context(channel_id: int, limit: int = 10) -> str:
@@ -411,16 +274,36 @@ async def build_mood_aware_prompt(channel_id: int, base_system_prompt: str) -> s
 def load_character() -> dict:
     """Load and return the character config from character.json (hot-reloadable)."""
     with open(CHARACTER_FILE, "r", encoding="utf-8") as f:
-        return json.load(f)
+        char = json.load(f)
+        
+    # Override via CLI flag
+    if getattr(args, "local", False):
+        char["run_local"] = True
+        
+    return char
 
 
-def trim_to_sentences(text: str, max_sentences: int) -> str:
-    """Trim text to at most `max_sentences` complete sentences."""
-    if max_sentences <= 0:
+def trim_to_length(text: str, max_chars: int) -> str:
+    """Trim text to complete sentences, staying roughly under `max_chars`."""
+    if max_chars <= 0:
         return text
     sentences = re.split(r'(?<=[.!?])(?:\s+|$)', text.strip())
     sentences = [s.strip() for s in sentences if s.strip()]
-    return " ".join(sentences[:max_sentences])
+    
+    kept_sentences = []
+    current_length = 0
+    for s in sentences:
+        if not kept_sentences:
+            # Always keep at least one sentence even if it's over the limit
+            kept_sentences.append(s)
+            current_length += len(s)
+        elif current_length + len(s) + 1 <= max_chars:
+            kept_sentences.append(s)
+            current_length += len(s) + 1
+        else:
+            break
+            
+    return " ".join(kept_sentences)
 
 
 def strip_action_text(text: str) -> str:
@@ -428,6 +311,9 @@ def strip_action_text(text: str) -> str:
     Remove roleplay-style action text from LLM responses.
     Cleans: *smirks*, **bold actions**, _looks up_, (short parentheticals)
     """
+    if '</think>' in text:
+        text = text.split('</think>', 1)[-1]
+    text = re.sub(r'<think>.*?</think>', '', text, flags=re.DOTALL) # Remove deepseek reasoning blocks
     text = re.sub(r'\*{1,2}[^*]{1,80}\*{1,2}', '', text)   # *action* / **action**
     text = re.sub(r'_[^_]{1,80}_', '', text)                 # _action_
     text = re.sub(r'\([^)]{1,60}\)', '', text)               # (action) — short only
@@ -499,7 +385,58 @@ class BehavioralTimingEngine:
 timing_engine = BehavioralTimingEngine()
 
 
-def build_messages(
+async def extract_memories_bg(channel_id: int, character: dict, history: list[dict]):
+    """Background task to extract core memories from recent chat."""
+    try:
+        transcript = ""
+        for msg in history[-10:]:
+            role = "AI" if msg["role"] == "assistant" else "USER"
+            content = msg.get("content", "")
+            transcript += f"{role}: {content}\n"
+        
+        prompt = (
+            "Analyze the following conversation transcript.\n"
+            "Identify if the USER or the AI revealed any new, important personal facts, preferences, or experienced a strong emotional moment.\n"
+            "If yes, extract them as a brief, bulleted list of facts (e.g. '- USER loves coffee', '- AI is afraid of spiders').\n"
+            "If nothing significant was revealed, output exactly 'NO_NEW_MEMORIES'.\n\n"
+            "Transcript:\n" + transcript
+        )
+        
+        payload = {
+            "model": character.get("model", "llama3"),
+            "messages": [{"role": "user", "content": prompt}],
+            "temperature": 0.3,
+        }
+        
+        headers = {}
+        if not character.get("run_local"):
+            headers["Authorization"] = f"Bearer {os.getenv('OPENROUTER_API_KEY')}"
+            endpoint = "https://openrouter.ai/api/v1/chat/completions"
+        else:
+            endpoint = "http://localhost:11434/v1/chat/completions"
+            
+        async with aiohttp.ClientSession() as session:
+            async with session.post(endpoint, headers=headers, json=payload, timeout=60) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    result = data.get("choices", [{}])[0].get("message", {}).get("content", "").strip()
+                    
+                    if result and "NO_NEW_MEMORIES" not in result:
+                        if '</think>' in result:
+                            result = result.split('</think>', 1)[-1].strip()
+                        result = re.sub(r'<think>.*?</think>', '', result, flags=re.DOTALL)
+                        
+                        db = await get_db()
+                        await db.execute(
+                            "INSERT INTO core_memories (channel_id, character, memory, timestamp) VALUES (?, ?, ?, ?)",
+                            (channel_id, character["name"], result, int(time.time()))
+                        )
+                        await db.commit()
+                        log.info(f"[🧠] Extracted new memory for #{channel_id}: {result[:50]}...")
+    except Exception as e:
+        log.exception(f"Memory extraction failed:")
+
+async def build_messages(
     channel_id: int,
     user_display: str,
     user_text: str,
@@ -531,6 +468,16 @@ def build_messages(
     # Use override if provided, otherwise fall back to character's own system_prompt
     base = system_prompt_override if system_prompt_override else character["system_prompt"].rstrip()
 
+    try:
+        db = await get_db()
+        async with db.execute("SELECT memory FROM core_memories WHERE channel_id=? AND character=? ORDER BY id DESC LIMIT 5", (channel_id, character["name"])) as cursor:
+            memories = await cursor.fetchall()
+            if memories:
+                memory_text = "\n".join([row["memory"] for row in memories])
+                base += f"\n\nCORE MEMORIES (Remember these facts):\n{memory_text}"
+    except Exception as e:
+        log.warning(f"Failed to load core memories: {e}")
+
     # Inject formatting rules at runtime — no need to add to every character.json
     base += (
         "\n\nFORMATTING RULES (always follow these):"
@@ -538,6 +485,13 @@ def build_messages(
         " This is a plain text chat — respond only with natural spoken words."
         " No asterisks, no parenthetical actions, no narration."
     )
+
+    cot_setting = character.get("use_cot", False)
+    if cot_setting:
+        if isinstance(cot_setting, str):
+            base += f" {cot_setting}"
+        else:
+            base += " Before responding, use a <think> block to briefly analyze the user's message, recall your character's persona, and plan a natural, in-character response."
 
     return [{"role": "system", "content": base}] + channel_histories[channel_id]
 
@@ -584,22 +538,34 @@ async def query_openrouter(messages: list[dict], character: dict, _retries: int 
     headers = {
         "Authorization": f"Bearer {OPENROUTER_API_KEY}",
         "Content-Type":  "application/json",
-        "HTTP-Referer":  "https://github.com/your-username/discord-character-bot",
-        "X-Title":       f"{character['name']} Discord Bot",
     }
+    if not character.get("run_local"):
+        headers["HTTP-Referer"] = "https://github.com/your-username/discord-character-bot"
+        headers["X-Title"] = f"{character['name']} Discord Bot"
 
+    default_model = "llama3" if character.get("run_local") else "meta-llama/llama-3.1-8b-instruct:free"
     payload = {
-        "model":       character.get("model", "meta-llama/llama-3.1-8b-instruct:free"),
-        "messages":    messages,
-        "temperature": character.get("temperature", 0.85),
-        "max_tokens":  character.get("max_sentences", 3) * 60,  # ~60 tokens per sentence
+        "model":             character.get("model", default_model),
+        "messages":          messages,
+        "temperature":       character.get("temperature", 0.85),
+        "frequency_penalty": character.get("frequency_penalty", 0.5),
+        "presence_penalty":  character.get("presence_penalty", 0.5),
     }
 
+    # OpenRouter charges per token, so we strictly cap it.
+    # Local Ollama is free, and reasoning models need huge token limits to think.
+    if character.get("run_local", False):
+        payload["max_tokens"] = 4000
+    else:
+        payload["max_tokens"] = character.get("max_sentences", 3) * 60
+
+    endpoint = get_llm_endpoint(character)
+    
     try:
         async with aiohttp.ClientSession() as session:
             async with session.post(
-                OPENROUTER_URL, headers=headers, json=payload,
-                timeout=aiohttp.ClientTimeout(total=60),
+                endpoint, headers=headers, json=payload,
+                timeout=aiohttp.ClientTimeout(total=300),
             ) as resp:
 
                 if resp.status == 429 and _retries > 0:
@@ -650,18 +616,35 @@ async def send_as_character(
     Long messages are automatically split at Discord's 2000-char limit.
     """
     webhook = await get_or_create_webhook(channel, character["name"])
-    chunks  = [text[i:i + 2000] for i in range(0, len(text), 2000)]
+    
+    # Split by explicit newlines first
+    raw_lines = [line.strip() for line in text.split('\n') if line.strip()]
+    
+    # Further split into individual sentences
+    chunks = []
+    for line in raw_lines:
+        sentences = re.split(r'(?<=[.!?])(?:\s+|$)', line)
+        sentences = [s.strip() for s in sentences if s.strip()]
+        chunks.extend(sentences)
 
-    if webhook:
-        for chunk in chunks:
-            await webhook.send(
-                content=chunk,
-                username=character["name"],
-                avatar_url=character.get("avatar_url"),
-            )
-    else:
-        for chunk in chunks:
-            await fallback.channel.send(chunk)
+    for i, chunk in enumerate(chunks):
+        # Add a short, human-like typing delay between consecutive messages
+        if i > 0:
+            delay = min(max(len(chunk) / 15.0, 0.8), 2.5)
+            async with channel.typing():
+                await asyncio.sleep(delay)
+                
+        # Safe fallback split for insanely long sentences over 2000 chars
+        sub_chunks = [chunk[j:j + 2000] for j in range(0, len(chunk), 2000)]
+        for sc in sub_chunks:
+            if webhook:
+                await webhook.send(
+                    content=sc,
+                    username=character["name"],
+                    avatar_url=character.get("avatar_url"),
+                )
+            else:
+                await fallback.channel.send(sc)
 
 
 async def maybe_send_followup(
@@ -711,11 +694,21 @@ async def maybe_send_followup(
 
     # ── Build a continuation-directive prompt ─────────────────────────────────
     system_prompt = character["system_prompt"].rstrip()
+    
+    thought_rule = ""
+    cot_setting = character.get("use_cot", False)
+    if cot_setting:
+        if isinstance(cot_setting, str):
+            thought_rule = f" {cot_setting}"
+        else:
+            thought_rule = " Before responding, use a <think> block to briefly analyze the context and plan your follow-up."
+
     system_prompt += (
         "\n\nFORMATTING RULES (always follow these):"
         " Do NOT use action text, stage directions, or roleplay emotes."
         " This is a plain text chat — respond only with natural spoken words."
         " No asterisks, no parenthetical actions, no narration."
+        f"{thought_rule}"
         "\n\nCONTINUATION DIRECTIVE: You just sent a message and are now adding a"
         " brief follow-up thought. Write 1–2 sentences only. Do NOT repeat or"
         " summarise what you already said — add something new, like an afterthought,"
@@ -730,8 +723,11 @@ async def maybe_send_followup(
     if not followup_reply:
         return
 
+    if '</think>' in followup_reply:
+        channel_last_thoughts[channel_id] = followup_reply.split('</think>', 1)[0].replace('<think>', '').strip()
+
     followup_reply = strip_action_text(followup_reply)
-    followup_reply = trim_to_sentences(followup_reply, 2)   # hard cap at 2 sentences
+    followup_reply = trim_to_length(followup_reply, 150)   # hard cap roughly 150 chars
 
     # ── Typing indicator proportional to follow-up length ────────────────────
     typing_duration = timing_engine.calculate_typing_duration(followup_reply)
@@ -781,8 +777,12 @@ async def _process_human_message(
             log.warning("No reply received from OpenRouter.")
             return
 
+        # Extract the thought before stripping it
+        if '</think>' in reply:
+            channel_last_thoughts[channel_id] = reply.split('</think>', 1)[0].replace('<think>', '').strip()
+
         reply = strip_action_text(reply)
-        reply = trim_to_sentences(reply, character.get("max_sentences", 3))
+        reply = trim_to_length(reply, character.get("max_chars", 150))
 
         typing_duration = timing_engine.calculate_typing_duration(reply)
         elapsed  = asyncio.get_event_loop().time() - llm_start
@@ -826,11 +826,12 @@ bot = commands.Bot(command_prefix="!char ", intents=intents)
 
 @bot.event
 async def on_ready():
+    char = load_character()
+    if char.get("run_local", False):
+        ensure_ollama_running()
+
     await init_db()                           # Phase 0 — SQLite foundation
     await seed_gallery()                       # Phase 1 — Anti-Repetition Media Engine
-    board = os.getenv("PINTEREST_BOARD")
-    if board:
-        await sync_pins_to_db(board)          # Phase 2 — Pinterest Pipeline
     log.info(f"✅  Logged in as {bot.user} (ID: {bot.user.id})")
     log.info("─" * 40)
 
@@ -868,14 +869,17 @@ async def on_message(message: discord.Message):
         channel_bot_chains[channel_id] = chain + 1
         log.info(f"[🤖↔️🤖] Bot reply in #{message.channel.name} (chain {chain + 1}/{max_chain})")
 
-        msgs = build_messages(channel_id, message.author.display_name, message.content, character)
+        msgs = await build_messages(channel_id, message.author.display_name, message.content, character)
         async with message.channel.typing():
             reply = await query_openrouter(msgs, character)
         if not reply:
             return
 
+        if '</think>' in reply:
+            channel_last_thoughts[channel_id] = reply.split('</think>', 1)[0].replace('<think>', '').strip()
+
         reply = strip_action_text(reply)
-        reply = trim_to_sentences(reply, character.get("max_sentences", 3))
+        reply = trim_to_length(reply, character.get("max_chars", 150))
         channel_histories[channel_id].append({"role": "assistant", "content": reply})
         await send_as_character(message.channel, reply, character, message)
         return
@@ -923,7 +927,7 @@ async def on_message(message: discord.Message):
         enriched_prompt = await build_mood_aware_prompt(
             channel_id, character["system_prompt"]
         )
-        msgs = build_messages(
+        msgs = await build_messages(
             channel_id,
             message.author.display_name,
             message.content,
@@ -931,10 +935,17 @@ async def on_message(message: discord.Message):
             system_prompt_override=enriched_prompt,
         )
     else:
-        msgs = build_messages(
+        msgs = await build_messages(
             channel_id, message.author.display_name, message.content, character
         )
     # ── End Block B ────────────────────────────────────────────────────────────
+
+    # ── Block C: Trigger Background Memory Extraction ──────────────────────────
+    channel_msg_counts[channel_id] = channel_msg_counts.get(channel_id, 0) + 1
+    if channel_msg_counts[channel_id] % 5 == 0:
+        history = channel_histories.get(channel_id, [])
+        if history:
+            asyncio.create_task(extract_memories_bg(channel_id, character, history))
 
     log.info(f"[#{message.channel.name}] {message.author.display_name}: {message.content[:80]}")
     # Note: build_messages appends the user message to channel_histories here,
@@ -996,34 +1007,71 @@ async def status(ctx: commands.Context):
     )
 
 
+@bot.command(name="thought")
+async def show_thought(ctx: commands.Context):
+    """Peek into the LLM's internal reasoning for its last message."""
+    thought = channel_last_thoughts.get(ctx.channel.id)
+    if not thought:
+        await ctx.send("I don't have any recent thoughts saved for this channel. 💭")
+        return
+        
+    # Discord has a 2000 char limit; truncate if necessary
+    if len(thought) > 1900:
+        thought = thought[:1900] + "... (truncated)"
+        
+    await ctx.send(f"**🧠 Last internal thought:**\n```text\n{thought}\n```")
+
+
 @bot.command(name="postlife")
 async def post_life(ctx: commands.Context, tag: str = None):
-    """Post a non-repeating local gallery image. Usage: !char postlife [tag]"""
-    filename = await select_local_image(tag)
+    """Post a non-repeating local gallery image with a dynamically generated reason."""
+    img_data = await select_local_image(tag)
 
-    if not filename:
+    if not img_data:
         msg = f"No fresh images tagged `{tag}` right now. 🌱" if tag else "No fresh images available right now. 🌱"
         await ctx.send(msg)
         return
 
+    filename, description, tags = img_data["filename"], img_data["description"], img_data["tags"]
     file_path = f"./gallery/{filename}"
+    
     if not os.path.exists(file_path):
         await ctx.send(f"Image `{filename}` is registered but missing from disk.")
         log.warning(f"postlife: file not found on disk: {file_path}")
         return
 
+    character = load_character()
+
+    # Generate the human-like reason for posting using the text LLM
+    async with ctx.channel.typing():
+        mood_prompt = await build_mood_aware_prompt(ctx.channel.id, character["system_prompt"])
+        msgs = [
+            {"role": "system", "content": mood_prompt},
+            {
+                "role": "user", 
+                "content": f"You are about to share a photo in the chat. It is described as: '{description}'. The image tags are: {tags}. Write a short, natural first-person message (1-2 sentences) explaining why you are sharing this picture right now."
+            }
+        ]
+        
+        caption = await query_openrouter(msgs, character)
+        if not caption:
+            caption = "Thought I'd share this. ✨"
+            
+        caption = strip_action_text(caption)
+        caption = trim_to_length(caption, 150)
+
     try:
-        character = load_character()
         webhook = await get_or_create_webhook(ctx.channel, character["name"])
 
         if webhook:
             await webhook.send(
+                content=caption,
                 file=discord.File(file_path),
                 username=character["name"],
                 avatar_url=character.get("avatar_url"),
             )
         else:
-            await ctx.send(file=discord.File(file_path))
+            await ctx.send(content=caption, file=discord.File(file_path))
 
         db = await get_db()
         await db.execute(
@@ -1036,61 +1084,6 @@ async def post_life(ctx: commands.Context, tag: str = None):
     except Exception as e:
         await ctx.send("Couldn't send the image right now. 🌱")
         log.error(f"postlife error: {e}")
-
-
-@bot.command(name="postidea")
-async def post_idea(ctx: commands.Context):
-    """Post a non-repeating Pinterest pin with a mood-aware AI caption. Usage: !char postidea"""
-    character = load_character()
-
-    pin = await select_procedural_pin()
-    if not pin:
-        await ctx.send("No fresh pins available right now. 📌 Try again tomorrow.")
-        return
-
-    async with ctx.channel.typing():
-        image_bytes = await download_image_bytes(pin["image_url"])
-        if not image_bytes:
-            await ctx.send("Couldn't fetch that image. Try again in a moment.")
-            return
-
-        caption = await generate_caption_via_openrouter(image_bytes, ctx.channel.id, character)
-
-        # Fallback caption if vision model fails
-        if not caption:
-            caption = "✨"
-            log.warning("postidea: caption generation failed — using fallback.")
-
-        caption = strip_action_text(caption)
-        caption = trim_to_sentences(caption, character.get("max_sentences", 3))
-
-    try:
-        file    = discord.File(BytesIO(image_bytes), filename="pin.jpg")
-        webhook = await get_or_create_webhook(ctx.channel, character["name"])
-
-        if webhook:
-            await webhook.send(
-                content=caption,
-                file=file,
-                username=character["name"],
-                avatar_url=character.get("avatar_url"),
-            )
-        else:
-            await ctx.send(content=caption, file=file)
-
-        db = await get_db()
-        await db.execute(
-            """UPDATE procedural_pins
-               SET last_sent_at = ?, use_count = use_count + 1
-               WHERE pin_id = ?""",
-            (int(time.time()), pin["pin_id"])
-        )
-        await db.commit()
-        log.info(f"📌 Posted pin {pin['pin_id']} with generated caption.")
-
-    except Exception as e:
-        await ctx.send("Something went wrong posting the idea. 🌿")
-        log.error(f"postidea send error: {e}")
 
 
 @forget.error
@@ -1109,11 +1102,10 @@ if __name__ == "__main__":
     if not DISCORD_BOT_TOKEN:
         log.critical(f"DISCORD_BOT_TOKEN not set in: {ENV_FILE}")
         raise SystemExit(1)
-    if not OPENROUTER_API_KEY:
-        log.critical(f"OPENROUTER_API_KEY not set in: {ENV_FILE}")
-        raise SystemExit(1)
-
     char = load_character()
+    if OPENROUTER_API_KEY == "dummy-local-key" and "openrouter.ai" in LLM_API_URL and not char.get("run_local"):
+        log.critical(f"OPENROUTER_API_KEY not set in: {ENV_FILE}. (You can omit this if using a local LLM via LLM_API_URL or --local)")
+        raise SystemExit(1)
     log.info(f"📂 Folder    : {CHARACTER_DIR}")
     log.info(f"🎭 Character : {char['name']}")
     log.info(f"🧠 Model     : {char.get('model', 'N/A')}")

@@ -18,10 +18,12 @@ Each character posts with a custom name and avatar via Discord Webhooks — no B
 
 - 🪝 **Webhook-powered** — custom name + avatar per character, no BOT badge in chat
 - 🎭 **Fully configurable personas** — define any character via a single `character.json`
-- 🧠 **Per-channel memory** — each channel has its own conversation history
+- 🧠 **Episodic memory** — extracts personal facts and bonds from conversation into long-term SQLite storage
+- 💬 **Rapid-fire texting** — dynamically chops long responses into natural, short message chains with human typing delays
+- 🤔 **Reasoning model support (CoT)** — cleanly strips `<think>` blocks and optimizes lazy-prompting for deep-thinking models
 - 🤖 **Multi-character support** — run multiple characters simultaneously, each as their own bot
-- 💬 **Character-to-character interaction** — characters can reply to each other with loop prevention
 - 🔄 **Hot-reload** — update personality without restarting the bot
+- 🛡️ **Anti-repetition engine** — applies intelligent presence/frequency penalties to prevent AI looping
 - 📋 **Channel whitelist** — restrict characters to specific channels
 - ⚡ **Smart rate limiting** — auto-retries on temporary limits, skips on daily quota exhaustion
 - 🧹 **Action text filtering** — strips `*smirks*`, `*looks up*` and other roleplay artifacts automatically

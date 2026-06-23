@@ -19,5 +19,8 @@ build/
 .AppleDouble
 .LSOverride
 
-# ── Logs ──────────────────────────────────────────────────────
+# ── Logs & Database ───────────────────────────────────────────
 *.log
+*.db
+*.sqlite
+bot_data.db
