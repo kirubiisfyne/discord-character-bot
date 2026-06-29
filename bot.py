@@ -35,7 +35,7 @@ import aiosqlite
 from config import (
     VERSION, CHARACTER_DIR, CHARACTER_FILE,
     DISCORD_BOT_TOKEN, OPENROUTER_API_KEY, DEEPSEEK_API_KEY, LLM_API_URL,
-    DB_PATH, log, args
+    DB_PATH, log, args, ENV_FILE
 )
 
 # ── In-memory State ────────────────────────────────────────────────────────────

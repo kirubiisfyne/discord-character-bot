@@ -24,3 +24,6 @@ build/
 *.db
 *.sqlite
 bot_data.db
+
+# ── Gallery ───────────────────────────────────────────────────
+/gallery/

@@ -1,0 +1,16 @@
+[
+  {
+    "new_filename": "coffee_morning.jpg",
+    "status": "success",
+    "description": "A close up of a dark cup of coffee sitting on a wooden table, next to a notebook. Cozy morning vibes.",
+    "slug": "coffee-shop",
+    "time_of_day": "morning"
+  },
+  {
+    "new_filename": "nature_forest.jpg",
+    "status": "success",
+    "description": "A beautiful lush green forest bathed in sunlight with tall trees and dense foliage.",
+    "slug": "nature-walk",
+    "time_of_day": "afternoon"
+  }
+]

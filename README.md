@@ -21,14 +21,17 @@ Each character posts with a custom name and avatar via Discord Webhooks — no B
 - 🧠 **Episodic memory** — extracts personal facts and bonds from conversation into long-term SQLite storage
 - 💬 **Rapid-fire texting** — dynamically chops long responses into natural, short message chains with human typing delays
 - 🤔 **Reasoning model support (CoT)** — cleanly strips `<think>` blocks and optimizes lazy-prompting for deep-thinking models
+- 📸 **Dynamic Image CoT** — specify multiple custom Chain-of-Thought (CoT) reasoning strategies per character for different types of images (selfies, gaming, etc.)
 - 🤖 **Multi-character support** — run multiple characters simultaneously, each as their own bot
 - 🔄 **Hot-reload** — update personality without restarting the bot
 - 🛡️ **Anti-repetition engine** — applies intelligent presence/frequency penalties to prevent AI looping
 - 📋 **Channel whitelist** — restrict characters to specific channels
-- ⚡ **Smart rate limiting** — auto-retries on temporary limits, skips on daily quota exhaustion
+- ⚡ **Smart rate limiting & Fallback** — auto-retries on temporary limits, and automatically switches to a fallback model on API failure or quota exhaustion
 - 🧹 **Action text filtering** — strips `*smirks*`, `*looks up*` and other roleplay artifacts automatically
 - 🗄️ **SQLite persistence** — cooldowns and logs survive bot restarts
 - 🖼️ **Anti-repetition media engine** — post local images without repeating within 24 hours
+- 📦 **Gallery Archiving** — automatically zips up and archives used gallery images to save space
+- ⚡ **Spontaneous Photos** — characters can autonomously double-text with standalone "update pics" during active conversations
 - 🎨 **Mood & context alignment** — character tone adapts to the room's current energy
 - 📌 **Pinterest pipeline** — pull live pins, generate in-character captions, post without repeats
 
@@ -142,8 +145,11 @@ Edit `characters/mycharacter/character.json`:
 | `max_sentences` | int | `3` | Maximum sentences per reply |
 | `temperature` | float | `0.85` | Creativity: `0.7` = consistent, `0.95` = unpredictable |
 | `model` | string | `llama-3.1-8b:free` | Any [OpenRouter model](https://openrouter.ai/models) |
+| `fallback_model` | string | `null` | A backup model to automatically retry with if the main model fails or exhausts retries |
 | `mood_context` | bool | `true` | Inject recent chat history into system prompt for tone adaptation |
 | `vision_model` | string | `gemini-2.0-flash-exp:free` | OpenRouter vision model used for Pinterest pin captions |
+| `image_cot` | string/dict | `null` | Custom instructions instructing the LLM how to think about images inside `<think>` tags. Can be a string or a dictionary of strategies (e.g., `{"default": "...", "gaming": "..."}`) |
+| `spontaneous_photo_chance` | float | `0.0` | Probability (0-1) that the character will randomly follow up a text reply with a standalone gallery photo (double-texting) |
 | `bot_interaction.enabled` | bool | `false` | Allow this character to reply to other characters |
 | `bot_interaction.reply_chance` | float | `0.4` | Probability of replying to another character (0–1) |
 | `bot_interaction.max_bot_chain` | int | `3` | Max consecutive bot-to-bot replies before going quiet |
@@ -174,6 +180,9 @@ Drop images into a `gallery/` folder at the project root. On startup the bot sca
 mkdir gallery
 # Add images — name them descriptively for auto-tagging
 # e.g. morning_coffee.jpg  city_night.png  forest_nature.jpg
+
+# Alternatively, copy the starter kit from examples to get up and running instantly:
+# cp -r examples/gallery/* gallery/
 ```
 
 **Auto-tagging** — the seeder detects keywords in filenames:
