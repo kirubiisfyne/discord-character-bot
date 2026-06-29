@@ -18,13 +18,22 @@ Each character posts with a custom name and avatar via Discord Webhooks — no B
 
 - 🪝 **Webhook-powered** — custom name + avatar per character, no BOT badge in chat
 - 🎭 **Fully configurable personas** — define any character via a single `character.json`
-- 🧠 **Per-channel memory** — each channel has its own conversation history
+- 🧠 **Episodic memory** — extracts personal facts and bonds from conversation into long-term SQLite storage
+- 💬 **Rapid-fire texting** — dynamically chops long responses into natural, short message chains with human typing delays
+- 🤔 **Reasoning model support (CoT)** — cleanly strips `<think>` blocks and optimizes lazy-prompting for deep-thinking models
+- 📸 **Dynamic Image CoT** — specify multiple custom Chain-of-Thought (CoT) reasoning strategies per character for different types of images (selfies, gaming, etc.)
 - 🤖 **Multi-character support** — run multiple characters simultaneously, each as their own bot
-- 💬 **Character-to-character interaction** — characters can reply to each other with loop prevention
 - 🔄 **Hot-reload** — update personality without restarting the bot
+- 🛡️ **Anti-repetition engine** — applies intelligent presence/frequency penalties to prevent AI looping
 - 📋 **Channel whitelist** — restrict characters to specific channels
-- ⚡ **Smart rate limiting** — auto-retries on temporary limits, skips on daily quota exhaustion
+- ⚡ **Smart rate limiting & Fallback** — auto-retries on temporary limits, and automatically switches to a fallback model on API failure or quota exhaustion
 - 🧹 **Action text filtering** — strips `*smirks*`, `*looks up*` and other roleplay artifacts automatically
+- 🗄️ **SQLite persistence** — cooldowns and logs survive bot restarts
+- 🖼️ **Anti-repetition media engine** — post local images without repeating within 24 hours
+- 📦 **Gallery Archiving** — automatically zips up and archives used gallery images to save space
+- ⚡ **Spontaneous Photos** — characters can autonomously double-text with standalone "update pics" during active conversations
+- 🎨 **Mood & context alignment** — character tone adapts to the room's current energy
+- 📌 **Pinterest pipeline** — pull live pins, generate in-character captions, post without repeats
 
 ---
 
@@ -60,6 +69,7 @@ python bot.py --character characters/mycharacter
 - **Python 3.10+**
 - A **Discord bot application** ([Developer Portal](https://discord.com/developers/applications))
 - An **OpenRouter API key** ([openrouter.ai/keys](https://openrouter.ai/keys))
+- *(Optional)* A **SerpApi key** ([serpapi.com](https://serpapi.com)) — only needed for the Pinterest pipeline
 
 ---
 
@@ -92,6 +102,10 @@ cp .env.example characters/mycharacter/.env
 ```env
 DISCORD_BOT_TOKEN=your_discord_bot_token_here
 OPENROUTER_API_KEY=your_openrouter_api_key_here
+
+# Optional — only needed for !char postidea (Pinterest pipeline)
+SERPAPI_KEY=your_serpapi_key_here
+PINTEREST_BOARD=aesthetic-morning-mood
 ```
 
 ### 3. Configure your character
@@ -106,9 +120,10 @@ Edit `characters/mycharacter/character.json`:
   "listen_channels": [],
   "max_history": 20,
   "max_sentences": 3,
-  "reply_delay_seconds": 2,
   "temperature": 0.9,
   "model": "meta-llama/llama-3.1-8b-instruct:free",
+  "mood_context": true,
+  "vision_model": "google/gemini-2.0-flash-exp:free",
   "bot_interaction": {
     "enabled": false,
     "reply_chance": 0.4,
@@ -128,9 +143,13 @@ Edit `characters/mycharacter/character.json`:
 | `listen_channels` | array | `[]` | Channel IDs to respond in. Empty = all channels |
 | `max_history` | int | `20` | Messages to remember per channel |
 | `max_sentences` | int | `3` | Maximum sentences per reply |
-| `reply_delay_seconds` | int | `0` | Pause before responding to humans (feels natural) |
 | `temperature` | float | `0.85` | Creativity: `0.7` = consistent, `0.95` = unpredictable |
 | `model` | string | `llama-3.1-8b:free` | Any [OpenRouter model](https://openrouter.ai/models) |
+| `fallback_model` | string | `null` | A backup model to automatically retry with if the main model fails or exhausts retries |
+| `mood_context` | bool | `true` | Inject recent chat history into system prompt for tone adaptation |
+| `vision_model` | string | `gemini-2.0-flash-exp:free` | OpenRouter vision model used for Pinterest pin captions |
+| `image_cot` | string/dict | `null` | Custom instructions instructing the LLM how to think about images inside `<think>` tags. Can be a string or a dictionary of strategies (e.g., `{"default": "...", "gaming": "..."}`) |
+| `spontaneous_photo_chance` | float | `0.0` | Probability (0-1) that the character will randomly follow up a text reply with a standalone gallery photo (double-texting) |
 | `bot_interaction.enabled` | bool | `false` | Allow this character to reply to other characters |
 | `bot_interaction.reply_chance` | float | `0.4` | Probability of replying to another character (0–1) |
 | `bot_interaction.max_bot_chain` | int | `3` | Max consecutive bot-to-bot replies before going quiet |
@@ -145,8 +164,87 @@ All commands use the `!char ` prefix:
 | Command | Permission | Description |
 |---|---|---|
 | `!char status` | Everyone | Show character name, memory, and model |
+| `!char postlife` | Everyone | Post a non-repeating local gallery image |
+| `!char postlife <tag>` | Everyone | Post a gallery image matching a tag (e.g. `coffee`, `nature`) |
+| `!char postidea` | Everyone | Post a Pinterest pin with a mood-aware AI caption |
 | `!char forget` | Manage Messages | Wipe this channel's conversation history |
 | `!char reload` | Manage Messages | Hot-reload `character.json` without restarting |
+
+---
+
+## 🖼️ Anti-Repetition Media Engine (`!char postlife`)
+
+Drop images into a `gallery/` folder at the project root. On startup the bot scans the folder and registers every image in SQLite. When `!char postlife` is called, it picks the **least-used image that hasn't been posted in the last 24 hours** and sends it as the character via webhook.
+
+```bash
+mkdir gallery
+# Add images — name them descriptively for auto-tagging
+# e.g. morning_coffee.jpg  city_night.png  forest_nature.jpg
+
+# Alternatively, copy the starter kit from examples to get up and running instantly:
+# cp -r examples/gallery/* gallery/
+```
+
+**Auto-tagging** — the seeder detects keywords in filenames:
+`coffee`, `morning`, `nature`, `calm`, `night`, `city`, `food`, `travel`, `rain`, `books`, `aesthetic`, `cozy`, `autumn`, `summer`, `winter`, `spring`, `sunset`, `ocean`
+
+**Tag filtering:**
+```
+!char postlife          ← any available image
+!char postlife coffee   ← only images tagged "coffee"
+```
+
+**Cooldown reset** (if needed for testing):
+```bash
+sqlite3 bot_data.db "UPDATE image_pool SET last_sent_at=0;"
+```
+
+---
+
+## 🎨 Mood & Context Alignment
+
+Every human message is silently logged to SQLite. When the character is about to reply, it pulls the **last 10 messages** from that channel and injects them into the system prompt with a mood-reading instruction:
+
+> *"Read the messages above and identify the current mood — energetic, stressed, joking around, quiet and reflective? Match their cadence and energy naturally."*
+
+The character never references the instruction directly. Tone adaptation is invisible to users.
+
+**Toggle per character in `character.json`:**
+```json
+{ "mood_context": true }
+```
+
+Set to `false` to always use the static system prompt regardless of room energy.
+
+---
+
+## 📌 Pinterest Pipeline (`!char postidea`)
+
+Pulls live images from a Pinterest board via **SerpApi**, generates a short **mood-aware, in-character caption** using an OpenRouter vision model, and posts the image + caption via webhook — without repeating any pin within 24 hours.
+
+### Setup
+
+Add to the character's `.env`:
+```env
+SERPAPI_KEY=your_serpapi_key
+PINTEREST_BOARD=aesthetic-morning-mood
+```
+
+Add to `character.json`:
+```json
+{
+  "vision_model": "google/gemini-2.0-flash-exp:free"
+}
+```
+
+On every startup the bot syncs new pins from the board into SQLite (`INSERT OR IGNORE` — existing pins are never overwritten). If `PINTEREST_BOARD` is not set, startup proceeds normally and the feature is simply skipped.
+
+**Caption generation** uses the same `OPENROUTER_API_KEY` already configured — no second API key needed.
+
+**Check the pin pool:**
+```bash
+sqlite3 bot_data.db "SELECT pin_id, use_count, last_sent_at FROM procedural_pins;"
+```
 
 ---
 
@@ -156,13 +254,14 @@ Each character is its own Discord bot application with its own token.
 
 ```
 discord-character-bot/
+├── gallery/                  ← shared image pool for !char postlife
 └── characters/
     ├── alex/
     │   ├── character.json    ← Alex's personality
-    │   └── .env              ← Alex's bot token
+    │   └── .env              ← Alex's bot token + API keys
     └── sarah/
         ├── character.json    ← Sarah's personality
-        └── .env              ← Sarah's bot token
+        └── .env              ← Sarah's bot token + API keys
 ```
 
 **Add a new character:**
@@ -236,6 +335,7 @@ See [`examples/README.md`](examples/README.md) for tips on writing great system 
 | Llama 3.1 8B | `meta-llama/llama-3.1-8b-instruct:free` | Recommended default |
 | Gemma 3 4B | `google/gemma-3-4b-it:free` | Fast and lightweight |
 | Mistral 7B | `mistralai/mistral-7b-instruct:free` | Good general purpose |
+| Gemini 2.0 Flash | `google/gemini-2.0-flash-exp:free` | Recommended for vision/captions |
 
 Free tier: **50 requests/day**. Add $10 credits for 1,000/day → [openrouter.ai/credits](https://openrouter.ai/credits)
 
@@ -252,6 +352,14 @@ Free tier: **50 requests/day**. Add $10 credits for 1,000/day → [openrouter.ai
 | OpenRouter 429 — daily quota | Add credits at [openrouter.ai/credits](https://openrouter.ai/credits) or wait for midnight UTC reset |
 | Character uses `*action text*` | Already filtered automatically. Tighten `system_prompt` if it persists |
 | `character.json not found` | Check the `--character` path and that the file exists |
+| `aiosqlite` ImportError | Run `pip install -r requirements.txt` in your virtual environment |
+| `bot_data.db` not created | Ensure `on_ready` calls `init_db()` — should be automatic |
+| `!char postlife` sends nothing | Ensure `./gallery/` folder exists and contains `.png`/`.jpg` images |
+| `!char postlife` says "No fresh images" | All images in 24h cooldown — reset with `sqlite3 bot_data.db "UPDATE image_pool SET last_sent_at=0;"` |
+| `!char postidea` says "No fresh pins" | Check `SERPAPI_KEY` and `PINTEREST_BOARD` in `.env`; check startup logs for SerpApi errors |
+| Caption always falls back to ✨ | Vision model unavailable on free tier — set `vision_model` to `google/gemini-2.0-flash-exp:free` |
+| Mood context not affecting replies | Set `"mood_context": true` in `character.json`, send a few messages, then trigger a reply |
+| Pins not syncing on startup | `SERPAPI_KEY` or `PINTEREST_BOARD` missing from `.env` |
 
 ---
 

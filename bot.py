@@ -1,5 +1,5 @@
 """
-Discord Character Bot  v1.0.0
+Discord Character Bot  v1.2.0
 ──────────────────────────────
 Run fully configurable AI personas in Discord using OpenRouter LLMs.
 Each character posts via webhook — custom name and avatar, no BOT badge.
@@ -13,194 +13,84 @@ GitHub: https://github.com/your-username/discord-character-bot
 """
 
 import os
+import sys
 import re
 import json
 import logging
 import asyncio
 import argparse
 import random
+import subprocess
+import urllib.request
+import time
+import datetime
 
 import aiohttp
 import discord
 from discord.ext import commands
 from dotenv import load_dotenv
 
-VERSION = "1.0.0"
+import aiosqlite
 
-# ── CLI Args ───────────────────────────────────────────────────────────────────
-
-parser = argparse.ArgumentParser(
-    description="Discord Character Bot — run an AI persona in Discord via OpenRouter."
+from config import (
+    VERSION, CHARACTER_DIR, CHARACTER_FILE,
+    DISCORD_BOT_TOKEN, OPENROUTER_API_KEY, DEEPSEEK_API_KEY, LLM_API_URL,
+    DB_PATH, log, args, ENV_FILE
 )
-parser.add_argument(
-    "--character",
-    default=".",
-    metavar="PATH",
-    help="Path to character folder containing character.json and .env (default: current dir)",
-)
-args = parser.parse_args()
-
-CHARACTER_DIR  = os.path.abspath(args.character)
-CHARACTER_FILE = os.path.join(CHARACTER_DIR, "character.json")
-ENV_FILE       = os.path.join(CHARACTER_DIR, ".env")
-
-# ── Logging ────────────────────────────────────────────────────────────────────
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    datefmt="%H:%M:%S",
-)
-log = logging.getLogger("CharacterBot")
-
-# ── Environment ────────────────────────────────────────────────────────────────
-
-load_dotenv(ENV_FILE)
-
-DISCORD_BOT_TOKEN  = os.getenv("DISCORD_BOT_TOKEN")
-OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
-OPENROUTER_URL     = "https://openrouter.ai/api/v1/chat/completions"
 
 # ── In-memory State ────────────────────────────────────────────────────────────
 
-# Per-channel conversation history  {channel_id: [{"role": ..., "content": ...}]}
-channel_histories: dict[int, list[dict]] = {}
+from llm import get_llm_endpoint, ensure_ollama_running, query_openrouter
 
-# Per-channel webhook cache  {channel_id: discord.Webhook}
-channel_webhooks: dict[int, discord.Webhook] = {}
-
-# Per-channel consecutive bot-to-bot message counter  {channel_id: int}
-channel_bot_chains: dict[int, int] = {}
-
-# Webhook IDs owned by this bot instance — prevents the bot from replying to itself
-own_webhook_ids: set[int] = set()
-
-# Per-channel active response task — enables message interruption  {channel_id: asyncio.Task}
-channel_tasks: dict[int, asyncio.Task] = {}
-
-# ── Helper Functions ───────────────────────────────────────────────────────────
-
-def load_character() -> dict:
-    """Load and return the character config from character.json (hot-reloadable)."""
-    with open(CHARACTER_FILE, "r", encoding="utf-8") as f:
-        return json.load(f)
+from state import (
+    channel_histories,
+    channel_webhooks,
+    channel_last_activity,
+    channel_has_unanswered_proactive,
+    channel_idle_target,
+    channel_bot_chains,
+    channel_last_thoughts,
+    channel_msg_counts,
+    own_webhook_ids,
+    channel_tasks,
+)
+from database import get_db, init_db, extract_memories_bg
 
 
-def trim_to_sentences(text: str, max_sentences: int) -> str:
-    """Trim text to at most `max_sentences` complete sentences."""
-    if max_sentences <= 0:
+from gallery import seed_gallery, select_local_image, check_and_archive_gallery
+from chat_utils import (
+    get_channel_context,
+    build_mood_aware_prompt,
+    load_character,
+    trim_to_length,
+    strip_action_text,
+    build_messages,
+    get_image_cot,
+)
+
+def _deduplicate_reply(text: str) -> str:
+    """If the LLM repeated the same chunk multiple times, keep only one copy."""
+    text = text.strip()
+    if not text:
         return text
-    sentences = re.split(r'(?<=[.!?])(?:\s+|$)', text.strip())
-    sentences = [s.strip() for s in sentences if s.strip()]
-    return " ".join(sentences[:max_sentences])
-
-
-def strip_action_text(text: str) -> str:
-    """
-    Remove roleplay-style action text from LLM responses.
-    Cleans: *smirks*, **bold actions**, _looks up_, (short parentheticals)
-    """
-    text = re.sub(r'\*{1,2}[^*]{1,80}\*{1,2}', '', text)   # *action* / **action**
-    text = re.sub(r'_[^_]{1,80}_', '', text)                 # _action_
-    text = re.sub(r'\([^)]{1,60}\)', '', text)               # (action) — short only
-    text = re.sub(r'^[\s,;:\-]+', '', text)                  # leading punctuation artifacts
-    text = re.sub(r'\s{2,}', ' ', text).strip()              # collapse whitespace
+    length = len(text)
+    # Check if the text is made up of exact repeats of a substring
+    for repeats in (2, 3, 4):
+        if length % repeats == 0:
+            chunk_len = length // repeats
+            chunk = text[:chunk_len]
+            if chunk * repeats == text:
+                return chunk.strip()
+    # Approximate matching: check if the front chunk reappears right after itself
+    for repeats in (2, 3, 4):
+        chunk_len = length // repeats
+        if chunk_len < 10:
+            break
+        chunk = text[:chunk_len].strip()
+        remaining = text[chunk_len:].strip()
+        if remaining.startswith(chunk[:min(len(chunk), 20)]):
+            return chunk
     return text
-
-
-# ── Behavioral Timing Engine ───────────────────────────────────────────────────
-
-class BehavioralTimingEngine:
-    """
-    Simulates human-like reading and typing cadence.
-
-    Reading delay  — short silent pause that scales with incoming word count,
-                     mimicking the time a person takes to scan a message before
-                     they start typing back.
-    Typing duration — time spent inside Discord's typing indicator, scaled to
-                      the length of the outgoing response so longer replies feel
-                      like they actually took effort to write.
-    """
-
-    def __init__(self, base_cps: float = 14.0, variance: float = 3.0) -> None:
-        """
-        Args:
-            base_cps:  Baseline characters-per-second typing speed.
-            variance:  Maximum random +/- deviation from base_cps per message.
-        """
-        self.base_cps = base_cps
-        self.variance = variance
-
-    def calculate_reading_delay(self, incoming_text: str) -> float:
-        """
-        Simulate the time taken to scan an incoming message before responding.
-
-        Formula: (word_count * 0.04) + uniform(0.4, 1.2), capped at 3.5 s.
-
-        Args:
-            incoming_text: The raw message content received from the user.
-
-        Returns:
-            A float representing seconds to sleep silently (no typing indicator).
-        """
-        word_count  = len(incoming_text.split())
-        scan_time   = word_count * 0.04
-        jitter      = random.uniform(0.4, 1.2)
-        delay       = scan_time + jitter
-        return min(delay, 3.5)
-
-    def calculate_typing_duration(self, response_text: str) -> float:
-        """
-        Simulate the time taken to type out a response.
-
-        Formula: char_count / (base_cps ± variance), clamped to [1.2, 5.5] s.
-
-        Args:
-            response_text: The AI-generated reply that will be sent.
-
-        Returns:
-            A float representing seconds to hold the typing indicator open.
-        """
-        effective_cps = self.base_cps + random.uniform(-self.variance, self.variance)
-        effective_cps = max(effective_cps, 1.0)  # guard against near-zero division
-        duration      = len(response_text) / effective_cps
-        return max(1.2, min(duration, 5.5))
-
-
-# Module-level singleton — shared across all channels/events
-timing_engine = BehavioralTimingEngine()
-
-
-def build_messages(channel_id: int, user_display: str, user_text: str, character: dict) -> list[dict]:
-    """
-    Build the full message list for the OpenRouter API call:
-      [system prompt + formatting rules] + [channel history] + [new user message]
-
-    Side-effect: appends the new user message to channel_histories.
-    """
-    max_history = character.get("max_history", 20)
-
-    if channel_id not in channel_histories:
-        channel_histories[channel_id] = []
-
-    history = channel_histories[channel_id]
-    history.append({"role": "user", "content": f"{user_display}: {user_text}"})
-
-    # Keep history within configured limit
-    if len(history) > max_history:
-        channel_histories[channel_id] = history[-max_history:]
-
-    # Inject formatting rules at runtime — no need to add to every character.json
-    system_prompt = character["system_prompt"].rstrip()
-    system_prompt += (
-        "\n\nFORMATTING RULES (always follow these):"
-        " Do NOT use action text, stage directions, or roleplay emotes (e.g. *smirks*, *looks up*, *laughs*)."
-        " This is a plain text chat — respond only with natural spoken words."
-        " No asterisks, no parenthetical actions, no narration."
-    )
-
-    return [{"role": "system", "content": system_prompt}] + channel_histories[channel_id]
-
 
 async def get_or_create_webhook(channel: discord.TextChannel, char_name: str) -> discord.Webhook | None:
     """
@@ -233,69 +123,7 @@ async def get_or_create_webhook(channel: discord.TextChannel, char_name: str) ->
         return None
 
 
-async def query_openrouter(messages: list[dict], character: dict, _retries: int = 2) -> str | None:
-    """
-    Send a message list to OpenRouter and return the text reply.
 
-    Automatically retries on temporary 429 rate limits using the Retry-After hint.
-    Does NOT retry on daily quota exhaustion (free-models-per-day).
-    Returns None on unrecoverable error.
-    """
-    headers = {
-        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
-        "Content-Type":  "application/json",
-        "HTTP-Referer":  "https://github.com/your-username/discord-character-bot",
-        "X-Title":       f"{character['name']} Discord Bot",
-    }
-
-    payload = {
-        "model":       character.get("model", "meta-llama/llama-3.1-8b-instruct:free"),
-        "messages":    messages,
-        "temperature": character.get("temperature", 0.85),
-        "max_tokens":  character.get("max_sentences", 3) * 60,  # ~60 tokens per sentence
-    }
-
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.post(
-                OPENROUTER_URL, headers=headers, json=payload,
-                timeout=aiohttp.ClientTimeout(total=60),
-            ) as resp:
-
-                if resp.status == 429 and _retries > 0:
-                    try:
-                        data = await resp.json()
-                        error_meta = data.get("error", {}).get("metadata", {})
-                        error_msg  = data.get("error", {}).get("message", "")
-
-                        # Daily quota exhausted — retrying won't help, give up immediately
-                        if "per-day" in error_msg or "per_day" in error_msg:
-                            log.error("Daily free model quota exhausted. Add credits at openrouter.ai/credits")
-                            return None
-
-                        wait = float(error_meta.get("retry_after_seconds", 10))
-                    except Exception:
-                        wait = 10
-
-                    wait = min(wait, 30)  # cap at 30s
-                    log.warning(f"Rate limited — retrying in {wait:.1f}s ({_retries} retries left)")
-                    await asyncio.sleep(wait)
-                    return await query_openrouter(messages, character, _retries=_retries - 1)
-
-                if resp.status != 200:
-                    body = await resp.text()
-                    log.error(f"OpenRouter {resp.status}: {body}")
-                    return None
-
-                data = await resp.json()
-                return data["choices"][0]["message"]["content"].strip()
-
-    except asyncio.TimeoutError:
-        log.error("OpenRouter request timed out.")
-        return None
-    except Exception as e:
-        log.error(f"OpenRouter exception: {e}")
-        return None
 
 
 async def send_as_character(
@@ -303,6 +131,7 @@ async def send_as_character(
     text:      str,
     character: dict,
     fallback:  discord.Message,
+    file_path: str | None = None,
 ) -> None:
     """
     Post a reply via webhook (character name + avatar, no BOT badge).
@@ -310,99 +139,101 @@ async def send_as_character(
     Long messages are automatically split at Discord's 2000-char limit.
     """
     webhook = await get_or_create_webhook(channel, character["name"])
-    chunks  = [text[i:i + 2000] for i in range(0, len(text), 2000)]
+    
+    # Split by explicit newlines first
+    raw_lines = [line.strip() for line in text.split('\n') if line.strip()]
+    
+    # Further split into individual sentences
+    chunks = []
+    for line in raw_lines:
+        sentences = re.split(r'(?<=[.!?])(?:\s+|$)', line)
+        sentences = [s.strip() for s in sentences if s.strip()]
+        chunks.extend(sentences)
 
-    if webhook:
-        for chunk in chunks:
-            await webhook.send(
-                content=chunk,
-                username=character["name"],
-                avatar_url=character.get("avatar_url"),
-            )
-    else:
-        for chunk in chunks:
-            await fallback.channel.send(chunk)
+    for i, chunk in enumerate(chunks):
+        # Add a short, human-like typing delay between consecutive messages
+        if i > 0:
+            delay = min(max(len(chunk) / 15.0, 0.8), 2.5)
+            async with channel.typing():
+                await asyncio.sleep(delay)
+                
+        # Safe fallback split for insanely long sentences over 2000 chars
+        sub_chunks = [chunk[j:j + 2000] for j in range(0, len(chunk), 2000)]
+        for j, sc in enumerate(sub_chunks):
+            is_last = (i == len(chunks) - 1 and j == len(sub_chunks) - 1)
+            kwargs = {}
+            if is_last and file_path and os.path.exists(file_path):
+                kwargs['file'] = discord.File(file_path)
+                
+            if webhook:
+                await webhook.send(
+                    content=sc,
+                    username=character["name"],
+                    avatar_url=character.get("avatar_url"),
+                    **kwargs
+                )
+            else:
+                if fallback:
+                    await fallback.channel.send(sc, **kwargs)
+                else:
+                    await channel.send(sc, **kwargs)
 
 
-async def maybe_send_followup(
-    channel:    discord.TextChannel,
-    channel_id: int,
-    character:  dict,
-    fallback:   discord.Message,
-) -> None:
-    """
-    Optionally send a short follow-up after the main reply.
 
-    Simulates the human habit of adding an afterthought or continuation
-    shortly after sending a message. Fully opt-in via character.json:
-
-        "followup": {
-            "chance":    0.3,   // probability 0.0–1.0 (default 0 = disabled)
-            "min_delay": 1.5,   // seconds before the follow-up appears
-            "max_delay": 4.0
-        }
-
-    The LLM is re-called with the existing history plus a continuation
-    directive so the follow-up reads as a natural extension of the main reply.
-    """
-    followup_cfg = character.get("followup", {})
-    chance       = followup_cfg.get("chance", 0.0)
-
-    if chance <= 0.0 or random.random() > chance:
-        return
-
-    if channel_id not in channel_histories or not channel_histories[channel_id]:
-        return
-
-    # ── Silent afterthought pause (bot appears to have stopped, then reconsiders)
-    delay = random.uniform(
-        followup_cfg.get("min_delay", 1.5),
-        followup_cfg.get("max_delay", 4.0),
-    )
-    # Snapshot history length before sleeping — if new messages arrive during the
-    # delay the conversation has moved on and the follow-up no longer makes sense.
-    snapshot_len = len(channel_histories[channel_id])
-    log.debug(f"[💭] Follow-up triggered — waiting {delay:.2f}s")
-    await asyncio.sleep(delay)
-
-    if len(channel_histories.get(channel_id, [])) != snapshot_len:
-        log.debug("[💭] Follow-up aborted — conversation moved on.")
-        return
-
-    # ── Build a continuation-directive prompt ─────────────────────────────────
-    system_prompt = character["system_prompt"].rstrip()
-    system_prompt += (
-        "\n\nFORMATTING RULES (always follow these):"
-        " Do NOT use action text, stage directions, or roleplay emotes."
-        " This is a plain text chat — respond only with natural spoken words."
-        " No asterisks, no parenthetical actions, no narration."
-        "\n\nCONTINUATION DIRECTIVE: You just sent a message and are now adding a"
-        " brief follow-up thought. Write 1–2 sentences only. Do NOT repeat or"
-        " summarise what you already said — add something new, like an afterthought,"
-        " a clarification, or a natural continuation of your previous point."
-    )
-    messages = [{"role": "system", "content": system_prompt}] + channel_histories[channel_id]
-
-    # ── Fetch the follow-up from the LLM ─────────────────────────────────────
-    # Cap token budget to 2 sentences — we hard-trim anyway, no need to pay for more.
-    followup_character = {**character, "max_sentences": 2}
-    followup_reply = await query_openrouter(messages, followup_character)
-    if not followup_reply:
-        return
-
-    followup_reply = strip_action_text(followup_reply)
-    followup_reply = trim_to_sentences(followup_reply, 2)   # hard cap at 2 sentences
-
-    # ── Typing indicator proportional to follow-up length ────────────────────
-    typing_duration = timing_engine.calculate_typing_duration(followup_reply)
-    log.debug(f"[⌨️] Follow-up typing duration: {typing_duration:.2f}s")
+async def send_standalone_photo(channel: discord.TextChannel, character: dict, tag: str = None) -> bool:
+    """Helper to pick, caption, and send a standalone gallery image with CoT."""
+    img_data = await select_local_image(tag)
+    if not img_data and tag:
+        img_data = await select_local_image(None)
+        
+    if not img_data:
+        return False
+        
+    filename, description, tags = img_data["filename"], img_data["description"], img_data["tags"]
+    file_path = f"./gallery/{filename}"
+    
+    if not os.path.exists(file_path):
+        db = await get_db()
+        await db.execute("DELETE FROM image_pool WHERE filename = ?", (filename,))
+        await db.commit()
+        return False
+        
     async with channel.typing():
-        await asyncio.sleep(typing_duration)
-
-    # ── Deliver and persist ──────────────────────────────────────────────────
-    channel_histories[channel_id].append({"role": "assistant", "content": followup_reply})
-    log.info(f"[#{channel.name}] ↩ Follow-up: {followup_reply[:80]}")
-    await send_as_character(channel, followup_reply, character, fallback)
+        mood_prompt = await build_mood_aware_prompt(channel.id, character["system_prompt"])
+        msgs = [
+            {"role": "system", "content": mood_prompt},
+            {
+                "role": "user", 
+                "content": f"You are sending a photo to the chat. Description: '{description}'. Tags: {tags}. Write a short, casual caption. " + get_image_cot(character, tags)
+            }
+        ]
+        
+        caption, _ = await query_openrouter(msgs, character)
+        if not caption:
+            caption = "Thought I'd share this. ✨"
+            
+        if '</think>' in caption:
+            channel_last_thoughts[channel.id] = caption.split('</think>', 1)[0].replace('<think>', '').strip()
+            
+        caption = strip_action_text(caption)
+        caption = trim_to_length(caption, 150)
+        
+    await send_as_character(
+        channel=channel,
+        text=caption,
+        character=character,
+        fallback=None,
+        file_path=file_path
+    )
+    
+    db = await get_db()
+    await db.execute(
+        "UPDATE image_pool SET last_sent_at = ?, use_count = use_count + 1 WHERE filename = ?",
+        (int(time.time()), filename)
+    )
+    await db.commit()
+    asyncio.create_task(check_and_archive_gallery())
+    return True
 
 
 async def _process_human_message(
@@ -425,53 +256,90 @@ async def _process_human_message(
     channel_id = message.channel.id
 
     # ── Phase 1: Silent reading delay (cancellation point ①) ──────────────────
-    read_delay = timing_engine.calculate_reading_delay(message.content)
-    log.debug(f"[⏱] Reading delay: {read_delay:.2f}s")
+    read_delay = random.uniform(1.0, 2.5)
     await asyncio.sleep(read_delay)
 
-    # ── Phase 2+3: LLM under typing indicator; pad remaining to typing_duration ──
-    # The indicator opens before the LLM call and stays open until the
-    # response-proportional duration is fully consumed, so users always see
-    # feedback during the slow generation step.
-    llm_start = asyncio.get_event_loop().time()
+    # ── Phase 2+3: LLM under typing indicator ──
     async with message.channel.typing():
-        reply = await query_openrouter(msgs, character)   # cancellation point ②
+        reply, total_tokens = await query_openrouter(msgs, character)   # cancellation point ②
 
         if not reply:
-            log.warning("No reply received from OpenRouter.")
+            log.warning("No reply received from the LLM.")
             return
 
-        reply = strip_action_text(reply)
-        reply = trim_to_sentences(reply, character.get("max_sentences", 3))
+        # Extract the thought before stripping it
+        if '</think>' in reply:
+            channel_last_thoughts[channel_id] = reply.split('</think>', 1)[0].replace('<think>', '').strip()
 
-        typing_duration = timing_engine.calculate_typing_duration(reply)
-        elapsed  = asyncio.get_event_loop().time() - llm_start
-        leftover = typing_duration - elapsed
-        log.debug(
-            f"[⌨️] Typing: {typing_duration:.2f}s target "
-            f"(LLM {elapsed:.2f}s, padding {max(0.0, leftover):.2f}s)"
-        )
-        if leftover > 0:
-            await asyncio.sleep(leftover)   # cancellation point ③
+        reply = strip_action_text(reply)
+        
+        img_file_path = None
+        img_data = None
+        
+        # Remove any hallucinated [Sent a photo...] blocks that the LLM tries to mimic from its own history
+        reply = re.sub(r'\[Sent a photo of:.*?\]', '', reply).strip()
+        
+        photo_match = re.search(r'<send_photo(?:[:=]([^>]+))?>', reply)
+        if photo_match:
+            requested_tag = photo_match.group(1).strip() if photo_match.group(1) else None
+            # Strip ALL <send_photo...> tags (LLM sometimes emits multiples)
+            reply = re.sub(r'<send_photo(?:[:=][^>]+)?>', '', reply).strip()
+            # Deduplicate if the LLM repeated itself around the tags
+            reply = _deduplicate_reply(reply)
+            
+            img_data = await select_local_image(requested_tag)
+            # If the specific tag fails, gracefully fallback to ANY available image
+            if not img_data and requested_tag:
+                img_data = await select_local_image(None)
+                
+            if img_data:
+                file_path = f"./gallery/{img_data['filename']}"
+                if os.path.exists(file_path):
+                    img_file_path = file_path
+                    # Update the database to prevent sending this image again soon
+                    db = await get_db()
+                    await db.execute(
+                        "UPDATE image_pool SET last_sent_at = ?, use_count = use_count + 1 WHERE filename = ?",
+                        (int(time.time()), img_data['filename'])
+                    )
+                    await db.commit()
+                    asyncio.create_task(check_and_archive_gallery())
+                    
+        reply = trim_to_length(reply, character.get("max_chars", 150))
+        
+        if not reply and not img_file_path:
+            log.warning("Reply was entirely contained within <think> block or stripped. Dropping message.")
+            return
+
+        typing_duration = random.uniform(1.0, 3.5)
+        await asyncio.sleep(typing_duration)
 
     # ── Phase 4: Deliver ────────────────────────────────────────────────────
-    channel_histories[channel_id].append({"role": "assistant", "content": reply})
-    log.info(f"[#{message.channel.name}] {character['name']}: {reply[:80]}")
+    history_reply = reply
+    if img_file_path and img_data:
+        history_reply = f"[Sent a photo of: {img_data['description']}] {reply}".strip()
+        
+    channel_histories[channel_id].append({"role": "assistant", "content": history_reply})
+    log.info(f"[#{message.channel.name}] {character['name']}: {reply[:80]} (Total Tokens: {total_tokens})")
 
     await send_as_character(
         channel=message.channel,
-        text=reply,
+        text=reply if reply else "✨",
         character=character,
         fallback=message,
+        file_path=img_file_path,
     )
 
-    # ── Phase 5: Optional follow-up ─────────────────────────────────────────
-    await maybe_send_followup(
-        channel=message.channel,
-        channel_id=channel_id,
-        character=character,
-        fallback=message,
-    )
+    # ── Phase 5: Spontaneous Photo ──────────────────────────────────────────
+    if not img_file_path:
+        spontaneous_chance = character.get("spontaneous_photo_chance", 0.0)
+        if spontaneous_chance > 0 and random.random() < spontaneous_chance:
+            log.info(f"[⚡] Triggering spontaneous photo for #{message.channel.name}")
+            # Wait a short beat to make the double text feel natural
+            await asyncio.sleep(random.uniform(2.0, 4.0))
+            await send_standalone_photo(message.channel, character)
+
+
 
 
 # ── Bot Initialisation ─────────────────────────────────────────────────────────
@@ -481,66 +349,298 @@ intents.message_content = True   # Privileged intent — must be enabled in the 
 
 bot = commands.Bot(command_prefix="!char ", intents=intents)
 
+async def terminal_listener():
+    loop = asyncio.get_running_loop()
+    print("\n[Terminal] Listening for commands. Type 'update' to send a photo to the last active channel.")
+    while True:
+        try:
+            line = await loop.run_in_executor(None, sys.stdin.readline)
+            if not line:
+                break
+            line = line.strip().lower()
+            if line == "forget":
+                if not channel_last_activity:
+                    print("[Terminal] No active channels found.")
+                    continue
+                channel_id = max(channel_last_activity, key=channel_last_activity.get)
+                channel_histories.pop(channel_id, None)
+                channel = bot.get_channel(channel_id)
+                print(f"[Terminal] 🧠 Wiped memory for #{channel.name if channel else channel_id}.")
+                
+            elif line == "reload":
+                try:
+                    character = load_character()
+                    print(f"[Terminal] 🔄 Reloaded configuration for {character['name']}.")
+                except Exception as e:
+                    print(f"[Terminal] ❌ Failed to reload: {e}")
+                    
+            elif line == "status":
+                character = load_character()
+                print(f"[Terminal] 📊 Status: Running as {character['name']} | Model: {character['model']} | Local: {character.get('run_local', False)}")
+                
+            elif line == "thought":
+                if not channel_last_activity:
+                    print("[Terminal] No active channels found.")
+                    continue
+                channel_id = max(channel_last_activity, key=channel_last_activity.get)
+                thought = channel_last_thoughts.get(channel_id, "No recent thoughts recorded.")
+                channel = bot.get_channel(channel_id)
+                print(f"[Terminal] 💭 Last thought for #{channel.name if channel else channel_id}:")
+                print(thought)
+                
+            elif line.startswith("checkmeta"):
+                parts = line.split()
+                if len(parts) < 2:
+                    print("[Terminal] Usage: checkmeta <filename>")
+                    continue
+                filename = parts[1]
+                db = await get_db()
+                async with db.execute("SELECT use_count, description, tags, last_sent_at FROM image_pool WHERE filename = ?", (filename,)) as cursor:
+                    row = await cursor.fetchone()
+                
+                if not row:
+                    print(f"[Terminal] ❌ Image '{filename}' not found in database.")
+                else:
+                    use_count, desc, tags, last_sent = row
+                    sent_str = "Never" if last_sent == 0 else time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(last_sent))
+                    print(f"[Terminal] 🖼️ Metadata for {filename}:")
+                    print(f"Tags: {tags}")
+                    print(f"Uses: {use_count}")
+                    print(f"Sent: {sent_str}")
+                    print(f"Desc: {desc}")
+                    
+            elif line == "update":
+                if not channel_last_activity:
+                    print("[Terminal] No active channels found.")
+                    continue
+                channel_id = max(channel_last_activity, key=channel_last_activity.get)
+                channel = bot.get_channel(channel_id)
+                if not channel:
+                    print(f"[Terminal] ❌ Could not find channel {channel_id}.")
+                    continue
+                
+                img_data = await select_local_image(None)
+                if not img_data:
+                    print("[Terminal] ❌ No fresh images available.")
+                    continue
+                
+                filename = img_data["filename"]
+                description = img_data["description"]
+                tags = img_data["tags"]
+                file_path = f"./gallery/{filename}"
+                
+                if not os.path.exists(file_path):
+                    db = await get_db()
+                    await db.execute("DELETE FROM image_pool WHERE filename = ?", (filename,))
+                    await db.commit()
+                    print(f"[Terminal] ❌ Ghost file '{filename}' removed from DB. Try again.")
+                    continue
+                
+                character = load_character()
+                mood_prompt = await build_mood_aware_prompt(channel_id, character["system_prompt"])
+                msgs = [
+                    {"role": "system", "content": mood_prompt},
+                    {
+                        "role": "user",
+                        "content": f"You are sending a photo to the chat. Description: '{description}'. Tags: {tags}. Write a short, casual caption. " + get_image_cot(character, tags)
+                    }
+                ]
+                
+                caption, _ = await query_openrouter(msgs, character)
+                if not caption:
+                    caption = "Thought I'd share this. ✨"
+                caption = strip_action_text(caption)
+                caption = trim_to_length(caption, 150)
+                
+                try:
+                    webhook = await get_or_create_webhook(channel, character["name"])
+                    with open(file_path, "rb") as f:
+                        file = discord.File(f, filename=filename)
+                        if webhook:
+                            await webhook.send(
+                                content=caption,
+                                file=file,
+                                username=character["name"],
+                                avatar_url=character.get("avatar_url")
+                            )
+                        else:
+                            await channel.send(content=caption, file=file)
+                    
+                    db = await get_db()
+                    await db.execute(
+                        "UPDATE image_pool SET last_sent_at = ?, use_count = use_count + 1 WHERE filename = ?",
+                        (int(time.time()), filename)
+                    )
+                    await db.commit()
+                    asyncio.create_task(check_and_archive_gallery())
+                    channel_histories.setdefault(channel_id, []).append({"role": "assistant", "content": f"[Sent a photo of: {description}] {caption}"})
+                    print(f"[Terminal] ✅ Sent '{filename}' to #{channel.name} with caption: {caption[:60]}...")
+                except Exception as e:
+                    print(f"[Terminal] ❌ Failed to send update: {e}")
+                    
+        except Exception as e:
+            print(f"[Terminal] Listener error: {e}")
+
+
+async def setup_hook():
+    bot.loop.create_task(terminal_listener())
+    await bot.tree.sync()
+    log.info("Slash commands synced globally.")
+
+bot.setup_hook = setup_hook
+
+
 
 # ── Events ─────────────────────────────────────────────────────────────────────
 
+async def proactive_messaging_loop():
+    """Periodically check channels for inactivity and send spontaneous check-ins."""
+    await bot.wait_until_ready()
+    
+    # Pre-populate tracker if we know which channels to listen to
+    character = load_character()
+    listen_channels = character.get("listen_channels", [])
+    proactive_cfg = character.get("proactive_messaging", {})
+    for cid in listen_channels:
+        if cid not in channel_last_activity:
+            channel_last_activity[cid] = time.time()
+            channel_idle_target[cid] = random.uniform(proactive_cfg.get("idle_hours_min", 2), proactive_cfg.get("idle_hours_max", 8))
+
+    while not bot.is_closed():
+        try:
+            character = load_character()
+            proactive_cfg = character.get("proactive_messaging", {})
+            
+            if proactive_cfg.get("enabled", False):
+                idle_min = proactive_cfg.get("idle_hours_min", 2)
+                idle_max = proactive_cfg.get("idle_hours_max", 8)
+                photo_chance = proactive_cfg.get("photo_chance", 0.3)
+                now = time.time()
+                
+                for channel_id, last_active in list(channel_last_activity.items()):
+                    if channel_id not in channel_idle_target:
+                        channel_idle_target[channel_id] = random.uniform(idle_min, idle_max)
+                    target_hours = channel_idle_target[channel_id]
+                    
+                    if (now - last_active) >= target_hours * 3600:
+                        if not channel_has_unanswered_proactive.get(channel_id, False):
+                            channel = bot.get_channel(channel_id)
+                            if not channel:
+                                continue
+                                
+                            # Mark as triggered to avoid spamming
+                            channel_has_unanswered_proactive[channel_id] = True
+                            channel_last_activity[channel_id] = now
+                            
+                            log.info(f"[PROACTIVE] Triggering for #{channel.name}")
+                            
+                            # Photo Check-in
+                            if random.random() < photo_chance:
+                                img_data = await select_local_image(None)
+                                if img_data:
+                                    filename, desc, tags = img_data["filename"], img_data["description"], img_data["tags"]
+                                    file_path = f"./gallery/{filename}"
+                                    if os.path.exists(file_path):
+                                        prompt = f"The chat has been quiet for a while. You are reaching out randomly. You are sharing a photo described as: '{desc}'. Tags: {tags}. Write a short, natural 1-sentence caption."
+                                        msgs = await build_messages(channel_id, "System", prompt, character)
+                                        async with channel.typing():
+                                            caption, _ = await query_openrouter(msgs, character)
+                                        if not caption: caption = "Thought of you."
+                                        caption = trim_to_length(strip_action_text(caption), 150)
+                                        
+                                        webhook = await get_or_create_webhook(channel, character["name"])
+                                        if webhook:
+                                            await webhook.send(content=caption, file=discord.File(file_path), username=character["name"], avatar_url=character.get("avatar_url"))
+                                        else:
+                                            await channel.send(content=caption, file=discord.File(file_path))
+                                            
+                                        db = await get_db()
+                                        await db.execute("UPDATE image_pool SET last_sent_at = ?, use_count = use_count + 1 WHERE filename = ?", (int(time.time()), filename))
+                                        await db.commit()
+                                        asyncio.create_task(check_and_archive_gallery())
+                                        channel_histories.setdefault(channel_id, []).append({"role": "assistant", "content": f"[Sent a photo of: {desc}] {caption}"})
+                                        continue
+                                    else:
+                                        db = await get_db()
+                                        await db.execute("DELETE FROM image_pool WHERE filename = ?", (filename,))
+                                        await db.commit()
+                                        log.warning(f"[PROACTIVE] Ghost file '{filename}' removed from DB.")
+                                        continue
+                                        
+                            # Text Check-in (fallback or chosen)
+                            prompt = "The chat has been quiet for a while. Reach out to the user with a single, casual, low-effort sentence to check in. Do not say you are an AI."
+                            msgs = await build_messages(channel_id, "System", prompt, character)
+                            async with channel.typing():
+                                reply, _ = await query_openrouter(msgs, character)
+                            if reply:
+                                if '</think>' in reply:
+                                    channel_last_thoughts[channel_id] = reply.split('</think>', 1)[0].replace('<think>', '').strip()
+                                reply = trim_to_length(strip_action_text(reply), 150)
+                                if not reply:
+                                    log.warning("Proactive text was fully enclosed in <think> block. Dropping.")
+                                    continue
+                                channel_histories.setdefault(channel_id, []).append({"role": "assistant", "content": reply})
+                                await send_as_character(channel, reply, character, None)
+                                
+        except Exception as e:
+            log.exception(f"Proactive loop error:")
+            
+        await asyncio.sleep(30)  # Check every 30 seconds for responsiveness
+
+
 @bot.event
 async def on_ready():
+    char = load_character()
+    if char.get("run_local", False):
+        ensure_ollama_running()
+
+    await init_db()                           # Phase 0 — SQLite foundation
+    await seed_gallery()                       # Phase 1 — Anti-Repetition Media Engine
+    bot.loop.create_task(proactive_messaging_loop()) # Phase 2 — Proactive background task
     log.info(f"✅  Logged in as {bot.user} (ID: {bot.user.id})")
     log.info("─" * 40)
 
 
 @bot.event
 async def on_message(message: discord.Message):
+
     character  = load_character()
     channel_id = message.channel.id
-    bot_cfg    = character.get("bot_interaction", {})
-    is_webhook = bool(message.webhook_id)
 
-    # ── Other character (webhook) message ──────────────────────────────────────
+    # ── Ignore all bots and webhooks ───────────────────────────────────────────
     if message.author.bot:
-        if not is_webhook:
-            return  # ignore regular bots (moderation bots, etc.)
-        if message.webhook_id in own_webhook_ids:
-            return  # this is our own webhook message — never reply to ourselves
-        if not bot_cfg.get("enabled", False):
-            return  # bot-to-bot interaction disabled in config
-        if not isinstance(message.channel, discord.TextChannel):
-            return
-
-        chain     = channel_bot_chains.get(channel_id, 0)
-        max_chain = bot_cfg.get("max_bot_chain", 3)
-
-        if chain >= max_chain:
-            log.info(f"[⛔] Chain limit ({max_chain}) hit in #{message.channel.name} — staying quiet.")
-            return
-
-        if random.random() > bot_cfg.get("reply_chance", 0.4):
-            log.info("[🎲] Skipped bot-to-bot reply (chance roll).")
-            return
-
-        await asyncio.sleep(bot_cfg.get("reply_delay_seconds", 4))
-        channel_bot_chains[channel_id] = chain + 1
-        log.info(f"[🤖↔️🤖] Bot reply in #{message.channel.name} (chain {chain + 1}/{max_chain})")
-
-        msgs = build_messages(channel_id, message.author.display_name, message.content, character)
-        async with message.channel.typing():
-            reply = await query_openrouter(msgs, character)
-        if not reply:
-            return
-
-        reply = strip_action_text(reply)
-        reply = trim_to_sentences(reply, character.get("max_sentences", 3))
-        channel_histories[channel_id].append({"role": "assistant", "content": reply})
-        await send_as_character(message.channel, reply, character, message)
         return
 
-    # ── Human message ──────────────────────────────────────────────────────────
-
-    channel_bot_chains[channel_id] = 0  # reset chain on human activity
+    # ── Tracking for Proactive Messaging ─────────────────────────────────────────
+    channel_last_activity[channel_id] = time.time()
+    proactive_cfg = character.get("proactive_messaging", {})
+    channel_idle_target[channel_id] = random.uniform(proactive_cfg.get("idle_hours_min", 2), proactive_cfg.get("idle_hours_max", 8))
+    
+    if message.author.id != bot.user.id:
+        channel_has_unanswered_proactive[channel_id] = False
 
     if not isinstance(message.channel, discord.TextChannel):
         return
+
+    # ── Block A: Log human message to DB (Feature 3) ───────────────────────────
+    try:
+        db = await get_db()
+        await db.execute(
+            """INSERT INTO chat_logs
+               (channel_id, author_id, username, message_content, timestamp)
+               VALUES (?, ?, ?, ?, ?)""",
+            (
+                channel_id,
+                message.author.id,
+                str(message.author.display_name),
+                message.content,
+                int(time.time())
+            )
+        )
+        await db.commit()
+    except Exception as e:
+        log.warning(f"Chat log write failed (non-fatal): {e}")
+    # ── End Block A ────────────────────────────────────────────────────────────
 
     await bot.process_commands(message)
 
@@ -552,7 +652,33 @@ async def on_message(message: discord.Message):
     if listen_channels and channel_id not in listen_channels:
         return
 
-    msgs = build_messages(channel_id, message.author.display_name, message.content, character)
+    # ── Block B: Build mood-aware prompt if enabled (Feature 3) ────────────────
+    use_mood_context = character.get("mood_context", True)
+    if use_mood_context:
+        enriched_prompt = await build_mood_aware_prompt(
+            channel_id, character["system_prompt"]
+        )
+        msgs = await build_messages(
+            channel_id,
+            message.author.display_name,
+            message.content,
+            character,
+            system_prompt_override=enriched_prompt,
+        )
+    else:
+        msgs = await build_messages(
+            channel_id, message.author.display_name, message.content, character
+        )
+    # ── End Block B ────────────────────────────────────────────────────────────
+
+    # ── Block C: Trigger Background Memory Extraction ──────────────────────────
+    if character.get("memory_extraction", True):
+        channel_msg_counts[channel_id] = channel_msg_counts.get(channel_id, 0) + 1
+        if channel_msg_counts[channel_id] % 5 == 0:
+            history = channel_histories.get(channel_id, [])
+            if history:
+                asyncio.create_task(extract_memories_bg(channel_id, character, history))
+
     log.info(f"[#{message.channel.name}] {message.author.display_name}: {message.content[:80]}")
     # Note: build_messages appends the user message to channel_histories here,
     # before any task is created, so context is preserved even on cancellation.
@@ -613,6 +739,189 @@ async def status(ctx: commands.Context):
     )
 
 
+@bot.command(name="thought")
+async def show_thought(ctx: commands.Context):
+    """Peek into the LLM's internal reasoning for its last message."""
+    thought = channel_last_thoughts.get(ctx.channel.id)
+    if not thought:
+        await ctx.send("I don't have any recent thoughts saved for this channel. 💭")
+        return
+        
+    # Discord has a 2000 char limit; truncate if necessary
+    if len(thought) > 1900:
+        thought = thought[:1900] + "... (truncated)"
+        
+    await ctx.send(f"**🧠 Last internal thought:**\n```text\n{thought}\n```")
+
+
+@bot.command(name="checkmeta")
+async def check_metadata(ctx: commands.Context, filename: str = None):
+    """Check the stored metadata for an image to verify JSON updates."""
+    db = await get_db()
+    if filename:
+        cursor = await db.execute("SELECT filename, description, tags, use_count FROM image_pool WHERE filename LIKE ?", (f"%{filename}%",))
+    else:
+        cursor = await db.execute("SELECT filename, description, tags, use_count FROM image_pool ORDER BY RANDOM() LIMIT 1")
+        
+    row = await cursor.fetchone()
+
+    if not row:
+        await ctx.send(f"Could not find any metadata for `{filename}`. 📂" if filename else "No images found in the database. 📂")
+        return
+
+    fname, desc, tags, count = row
+    
+    # Truncate description to fit within Discord limits if somehow massive
+    if len(desc) > 1500:
+        desc = desc[:1500] + "..."
+        
+    response = (
+        f"**File:** `{fname}`\n"
+        f"**Tags:** `{tags}`\n"
+        f"**Send Count:** `{count}`\n"
+        f"**Description:**\n> {desc}"
+    )
+    await ctx.send(response)
+
+
+@bot.command(name="postlife")
+async def post_life(ctx: commands.Context, tag: str = None):
+    """Post a non-repeating local gallery image with a dynamically generated reason."""
+    img_data = await select_local_image(tag)
+
+    if not img_data:
+        msg = f"No fresh images tagged `{tag}` right now. 🌱" if tag else "No fresh images available right now. 🌱"
+        await ctx.send(msg)
+        return
+
+    filename, description, tags = img_data["filename"], img_data["description"], img_data["tags"]
+    file_path = f"./gallery/{filename}"
+    
+    if not os.path.exists(file_path):
+        db = await get_db()
+        await db.execute("DELETE FROM image_pool WHERE filename = ?", (filename,))
+        await db.commit()
+        await ctx.send(f"Found a ghost image `{filename}` that was deleted from disk. Cleaned it from the database! Please run the command again.")
+        log.warning(f"postlife: file not found on disk, removed from DB: {file_path}")
+        return
+
+    character = load_character()
+
+    # Generate the human-like reason for posting using the text LLM
+    async with ctx.channel.typing():
+        mood_prompt = await build_mood_aware_prompt(ctx.channel.id, character["system_prompt"])
+        msgs = [
+            {"role": "system", "content": mood_prompt},
+            {
+                "role": "user", 
+                "content": f"You are sending a photo to the chat. Description: '{description}'. Tags: {tags}. Write a short, casual caption. " + get_image_cot(character, tags)
+            }
+        ]
+        
+        caption, _ = await query_openrouter(msgs, character)
+        if not caption:
+            caption = "Thought I'd share this. ✨"
+            
+        caption = strip_action_text(caption)
+        caption = trim_to_length(caption, 150)
+
+    try:
+        webhook = await get_or_create_webhook(ctx.channel, character["name"])
+        if webhook:
+            await webhook.send(
+                content=caption,
+                file=discord.File(file_path),
+                username=character["name"],
+                avatar_url=character.get("avatar_url"),
+            )
+        else:
+            await ctx.send(content=caption, file=discord.File(file_path))
+
+        db = await get_db()
+        await db.execute(
+            "UPDATE image_pool SET last_sent_at = ?, use_count = use_count + 1 WHERE filename = ?",
+            (int(time.time()), filename)
+        )
+        await db.commit()
+        asyncio.create_task(check_and_archive_gallery())
+        channel_histories.setdefault(ctx.channel.id, []).append({"role": "assistant", "content": f"[Sent a photo of: {description}] {caption}"})
+        log.info(f"🖼️  Posted gallery image: {filename}")
+
+    except Exception as e:
+        await ctx.send("Couldn't send the image right now. 🌱")
+        log.error(f"postlife error: {e}")
+
+
+@bot.tree.command(name="update", description="Post a photo with a dynamically generated reason (imitating a life update).")
+async def slash_update(interaction: discord.Interaction, tag: str = None):
+    await interaction.response.defer()
+    
+    img_data = await select_local_image(tag)
+    if not img_data:
+        msg = f"No fresh images tagged `{tag}` right now. 🌱" if tag else "No fresh images available right now. 🌱"
+        await interaction.followup.send(msg)
+        return
+
+    filename, description, tags = img_data["filename"], img_data["description"], img_data["tags"]
+    file_path = f"./gallery/{filename}"
+    
+    if not os.path.exists(file_path):
+        db = await get_db()
+        await db.execute("DELETE FROM image_pool WHERE filename = ?", (filename,))
+        await db.commit()
+        await interaction.followup.send(f"Found a ghost image `{filename}` that was deleted from disk. Cleaned it from the database! Please run the command again.")
+        log.warning(f"slash_update: file not found on disk, removed from DB: {file_path}")
+        return
+
+    character = load_character()
+
+    # Generate the human-like reason for posting using the text LLM
+    mood_prompt = await build_mood_aware_prompt(interaction.channel_id, character["system_prompt"])
+    msgs = [
+        {"role": "system", "content": mood_prompt},
+        {
+            "role": "user", 
+            "content": f"You are sending a photo to the chat. Description: '{description}'. Tags: {tags}. Write a short, casual caption. " + get_image_cot(character, tags)
+        }
+    ]
+    
+    caption, _ = await query_openrouter(msgs, character)
+    if not caption:
+        caption = "Thought I'd share this. ✨"
+        
+    caption = strip_action_text(caption)
+    caption = trim_to_length(caption, 150)
+
+    try:
+        webhook = await get_or_create_webhook(interaction.channel, character["name"])
+        with open(file_path, "rb") as f:
+            file = discord.File(f, filename=filename)
+            if webhook:
+                await webhook.send(
+                    content=caption,
+                    file=file,
+                    username=character["name"],
+                    avatar_url=character.get("avatar_url")
+                )
+            else:
+                await interaction.channel.send(content=caption, file=file)
+        
+        db = await get_db()
+        await db.execute(
+            "UPDATE image_pool SET last_sent_at = ?, use_count = use_count + 1 WHERE filename = ?",
+            (int(time.time()), filename)
+        )
+        await db.commit()
+        asyncio.create_task(check_and_archive_gallery())
+        channel_histories.setdefault(interaction.channel_id, []).append({"role": "assistant", "content": f"[Sent a photo of: {description}] {caption}"})
+        log.info(f"🖼️  Posted gallery image via slash command: {filename}")
+        
+        await interaction.followup.send("Update posted!", ephemeral=True)
+    except Exception as e:
+        log.error(f"Failed to post image via slash command: {e}")
+        await interaction.followup.send("Couldn't send the image right now. 🌱")
+
+
 @forget.error
 @reload_char.error
 async def permission_error(ctx: commands.Context, error):
@@ -629,11 +938,10 @@ if __name__ == "__main__":
     if not DISCORD_BOT_TOKEN:
         log.critical(f"DISCORD_BOT_TOKEN not set in: {ENV_FILE}")
         raise SystemExit(1)
-    if not OPENROUTER_API_KEY:
-        log.critical(f"OPENROUTER_API_KEY not set in: {ENV_FILE}")
-        raise SystemExit(1)
-
     char = load_character()
+    if OPENROUTER_API_KEY == "dummy-local-key" and "openrouter.ai" in LLM_API_URL and not char.get("run_local"):
+        log.critical(f"OPENROUTER_API_KEY not set in: {ENV_FILE}. (You can omit this if using a local LLM via LLM_API_URL or --local)")
+        raise SystemExit(1)
     log.info(f"📂 Folder    : {CHARACTER_DIR}")
     log.info(f"🎭 Character : {char['name']}")
     log.info(f"🧠 Model     : {char.get('model', 'N/A')}")
