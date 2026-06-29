@@ -198,3 +198,36 @@ async def build_messages(
     final_messages.append({"role": "user", "content": f"{dynamic_context.strip()}\n\n{last_user_msg}"})
     
     return final_messages
+
+
+def get_image_cot(character: dict, tags: str) -> str:
+    """
+    Get the appropriate CoT instructions for an image based on character config and image tags.
+    Supports both a simple string and a dictionary mapping tags to CoT instructions.
+    """
+    default_cot = "Treat this as a live 'update pic' you just took right now. DO NOT explicitly say 'I just took this' or explain why you are sending it. Just react naturally as if you're living it in the moment. CRITICAL: You MUST wrap ALL of your reasoning and thinking strictly inside <think>...</think> tags. After the </think> tag, output ONLY the final caption."
+    
+    custom_cot = character.get('image_cot')
+    if not custom_cot:
+        return default_cot
+        
+    if isinstance(custom_cot, str):
+        return custom_cot + " CRITICAL: You MUST wrap ALL of your reasoning and thinking strictly inside <think>...</think> tags. After the </think> tag, output ONLY the final caption."
+        
+    if isinstance(custom_cot, dict):
+        options_text = ""
+        for key, value in custom_cot.items():
+            if key != "default":
+                options_text += f"\n- {key}: {value}"
+        
+        default_opt = custom_cot.get("default", default_cot)
+        options_text += f"\n- default: {default_opt}"
+        
+        return (
+            f"You have multiple reasoning strategies available for different types of images. "
+            f"Based on the image description and tags, pick the most appropriate strategy from this list:"
+            f"{options_text}\n\n"
+            f"CRITICAL: You MUST wrap ALL of your strategy selection, reasoning, and thinking strictly inside <think>...</think> tags. Do NOT output any thinking outside of these tags. After the </think> tag, output ONLY the final caption and absolutely nothing else."
+        )
+        
+    return default_cot

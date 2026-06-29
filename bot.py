@@ -57,7 +57,7 @@ from state import (
 from database import get_db, init_db, extract_memories_bg
 
 
-from gallery import seed_gallery, select_local_image
+from gallery import seed_gallery, select_local_image, check_and_archive_gallery
 from chat_utils import (
     get_channel_context,
     build_mood_aware_prompt,
@@ -65,6 +65,7 @@ from chat_utils import (
     trim_to_length,
     strip_action_text,
     build_messages,
+    get_image_cot,
 )
 
 def _deduplicate_reply(text: str) -> str:
@@ -179,6 +180,62 @@ async def send_as_character(
 
 
 
+async def send_standalone_photo(channel: discord.TextChannel, character: dict, tag: str = None) -> bool:
+    """Helper to pick, caption, and send a standalone gallery image with CoT."""
+    img_data = await select_local_image(tag)
+    if not img_data and tag:
+        img_data = await select_local_image(None)
+        
+    if not img_data:
+        return False
+        
+    filename, description, tags = img_data["filename"], img_data["description"], img_data["tags"]
+    file_path = f"./gallery/{filename}"
+    
+    if not os.path.exists(file_path):
+        db = await get_db()
+        await db.execute("DELETE FROM image_pool WHERE filename = ?", (filename,))
+        await db.commit()
+        return False
+        
+    async with channel.typing():
+        mood_prompt = await build_mood_aware_prompt(channel.id, character["system_prompt"])
+        msgs = [
+            {"role": "system", "content": mood_prompt},
+            {
+                "role": "user", 
+                "content": f"You are sending a photo to the chat. Description: '{description}'. Tags: {tags}. Write a short, casual caption. " + get_image_cot(character, tags)
+            }
+        ]
+        
+        caption, _ = await query_openrouter(msgs, character)
+        if not caption:
+            caption = "Thought I'd share this. ✨"
+            
+        if '</think>' in caption:
+            channel_last_thoughts[channel.id] = caption.split('</think>', 1)[0].replace('<think>', '').strip()
+            
+        caption = strip_action_text(caption)
+        caption = trim_to_length(caption, 150)
+        
+    await send_as_character(
+        channel=channel,
+        text=caption,
+        character=character,
+        fallback=None,
+        file_path=file_path
+    )
+    
+    db = await get_db()
+    await db.execute(
+        "UPDATE image_pool SET last_sent_at = ?, use_count = use_count + 1 WHERE filename = ?",
+        (int(time.time()), filename)
+    )
+    await db.commit()
+    asyncio.create_task(check_and_archive_gallery())
+    return True
+
+
 async def _process_human_message(
     message:   discord.Message,
     character: dict,
@@ -246,6 +303,7 @@ async def _process_human_message(
                         (int(time.time()), img_data['filename'])
                     )
                     await db.commit()
+                    asyncio.create_task(check_and_archive_gallery())
                     
         reply = trim_to_length(reply, character.get("max_chars", 150))
         
@@ -271,6 +329,15 @@ async def _process_human_message(
         fallback=message,
         file_path=img_file_path,
     )
+
+    # ── Phase 5: Spontaneous Photo ──────────────────────────────────────────
+    if not img_file_path:
+        spontaneous_chance = character.get("spontaneous_photo_chance", 0.0)
+        if spontaneous_chance > 0 and random.random() < spontaneous_chance:
+            log.info(f"[⚡] Triggering spontaneous photo for #{message.channel.name}")
+            # Wait a short beat to make the double text feel natural
+            await asyncio.sleep(random.uniform(2.0, 4.0))
+            await send_standalone_photo(message.channel, character)
 
 
 
@@ -375,7 +442,7 @@ async def terminal_listener():
                     {"role": "system", "content": mood_prompt},
                     {
                         "role": "user",
-                        "content": f"You are about to share a photo in the chat. It is described as: '{description}'. The image tags are: {tags}. Write a short, natural first-person message (1-2 sentences) explaining why you are sharing this picture right now."
+                        "content": f"You are sending a photo to the chat. Description: '{description}'. Tags: {tags}. Write a short, casual caption. " + get_image_cot(character, tags)
                     }
                 ]
                 
@@ -405,6 +472,7 @@ async def terminal_listener():
                         (int(time.time()), filename)
                     )
                     await db.commit()
+                    asyncio.create_task(check_and_archive_gallery())
                     channel_histories.setdefault(channel_id, []).append({"role": "assistant", "content": f"[Sent a photo of: {description}] {caption}"})
                     print(f"[Terminal] ✅ Sent '{filename}' to #{channel.name} with caption: {caption[:60]}...")
                 except Exception as e:
@@ -489,6 +557,7 @@ async def proactive_messaging_loop():
                                         db = await get_db()
                                         await db.execute("UPDATE image_pool SET last_sent_at = ?, use_count = use_count + 1 WHERE filename = ?", (int(time.time()), filename))
                                         await db.commit()
+                                        asyncio.create_task(check_and_archive_gallery())
                                         channel_histories.setdefault(channel_id, []).append({"role": "assistant", "content": f"[Sent a photo of: {desc}] {caption}"})
                                         continue
                                     else:
@@ -745,7 +814,7 @@ async def post_life(ctx: commands.Context, tag: str = None):
             {"role": "system", "content": mood_prompt},
             {
                 "role": "user", 
-                "content": f"You are about to share a photo in the chat. It is described as: '{description}'. The image tags are: {tags}. Write a short, natural first-person message (1-2 sentences) explaining why you are sharing this picture right now."
+                "content": f"You are sending a photo to the chat. Description: '{description}'. Tags: {tags}. Write a short, casual caption. " + get_image_cot(character, tags)
             }
         ]
         
@@ -774,6 +843,7 @@ async def post_life(ctx: commands.Context, tag: str = None):
             (int(time.time()), filename)
         )
         await db.commit()
+        asyncio.create_task(check_and_archive_gallery())
         channel_histories.setdefault(ctx.channel.id, []).append({"role": "assistant", "content": f"[Sent a photo of: {description}] {caption}"})
         log.info(f"🖼️  Posted gallery image: {filename}")
 
@@ -811,7 +881,7 @@ async def slash_update(interaction: discord.Interaction, tag: str = None):
         {"role": "system", "content": mood_prompt},
         {
             "role": "user", 
-            "content": f"You are about to share a photo in the chat. It is described as: '{description}'. The image tags are: {tags}. Write a short, natural first-person message (1-2 sentences) explaining why you are sharing this picture right now."
+            "content": f"You are sending a photo to the chat. Description: '{description}'. Tags: {tags}. Write a short, casual caption. " + get_image_cot(character, tags)
         }
     ]
     
@@ -842,6 +912,7 @@ async def slash_update(interaction: discord.Interaction, tag: str = None):
             (int(time.time()), filename)
         )
         await db.commit()
+        asyncio.create_task(check_and_archive_gallery())
         channel_histories.setdefault(interaction.channel_id, []).append({"role": "assistant", "content": f"[Sent a photo of: {description}] {caption}"})
         log.info(f"🖼️  Posted gallery image via slash command: {filename}")
         
